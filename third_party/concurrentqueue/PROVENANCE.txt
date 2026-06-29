@@ -1,0 +1,3 @@
+Vendored from https://github.com/cameron314/concurrentqueue
+Commit: 1e2def448e43fb3362123ab5ff039c39e1ba5cfd
+Used only by benchmark/bench.cc as a comparison point. Not included by queue.h.
