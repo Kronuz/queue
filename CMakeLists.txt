@@ -25,6 +25,13 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   target_link_libraries(queue_concurrent PRIVATE queue)
   add_test(NAME queue_concurrent COMMAND queue_concurrent)
 
+  # (c) Runnable Xapiand-shaped example: bounded producer/consumer worker queue,
+  # timeouts, both-ended priority/tail-steal paths, and graceful shutdown.
+  add_executable(queue_work_queue examples/work_queue.cc)
+  target_link_libraries(queue_work_queue PRIVATE queue)
+  add_test(NAME queue_work_queue COMMAND queue_work_queue)
+  set_tests_properties(queue_work_queue PROPERTIES TIMEOUT 10)
+
   # Sanitizer builds of the concurrent stress test. These are separate targets
   # (not run by ctest by default) because they want the Homebrew LLVM toolchain
   # and a scaled item count. Build with:

@@ -142,19 +142,21 @@ q.finish();   // any remaining blocked thread wakes and returns false
 
 ## Build & test
 
-Header-only. To build and run both tests:
+Header-only. To build and run the tests and the self-checking example:
 
 ```sh
 cmake -B build && cmake --build build && ctest --test-dir build
 ```
 
-`ctest` runs two checks: `queue` (single-threaded API coverage in
-`test/test.cc`) and `queue_concurrent` (the N-producer / M-consumer stress test
-in `test/concurrent.cc`). Or directly:
+`ctest` runs three checks: `queue` (single-threaded API coverage in
+`test/test.cc`), `queue_concurrent` (the N-producer / M-consumer stress test in
+`test/concurrent.cc`), and `queue_work_queue` (a Xapiand-shaped bounded worker
+queue example in `examples/work_queue.cc`). Or directly:
 
 ```sh
 c++ -std=c++20 -I. test/test.cc -o test/test && ./test/test
 c++ -std=c++20 -O2 -I. test/concurrent.cc -o test/concurrent && ./test/concurrent
+c++ -std=c++20 -O2 -I. examples/work_queue.cc -o examples/work_queue && ./examples/work_queue
 ```
 
 ## Stability & performance
