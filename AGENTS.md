@@ -115,13 +115,13 @@ produce a lost wakeup, a deadlock, or a torn read rather than a compile error.
   `clear` subtracts. `count()`, the bound check, and the destructor's
   `_cnt -= size` all rely on it staying in step with the container. An asymmetric
   edit desyncs the bound silently.
-- **The `FIXME` over-signalling is the perf cost, not a correctness bug.** The
-  `notify_all()` on both condition variables in every op's failure path (the
-  `FIXME: This block shouldn't be needed!` blocks) is the dominant cost in the
-  benchmark. It is the obvious thing to tighten, but verify against the
-  sanitizers and the concurrent test before trusting that it is truly redundant,
-  and make the change upstream in Xapiand so it can be reconciled. Do not remove
-  it casually.
+- **The failure-path over-signalling was removed (was the `FIXME` blocks).** Every op's
+  failure path used to `notify_all()` both condition variables (the
+  `FIXME: This block shouldn't be needed!` blocks). It was redundant: a failed push/pop
+  changes no state, so no waiter can make progress, and shutdown wakeups already come from
+  `end()`/`finish()`. Removed and verified correctness-neutral under ASan **and** TSan
+  (`test/concurrent.cc`, exact exactly-once accounting in every scenario). Do NOT re-add a
+  failure-path notify; only a *successful* op notifies now.
 - **`force` bypasses the bound.** `push_*(..., force=true)` skips the wait and
   the capacity check entirely, so it can push past `_hard_limit`. That is by
   design; just know it sidesteps back-pressure.

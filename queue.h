@@ -260,14 +260,15 @@ namespace queue {
 			bool pushed = _push_back_impl(std::forward<E>(element), timeout, lk, force);
 			lk.unlock();
 
+			// Only a successful op changes queue state, so only it notifies. A
+			// failed push/pop (timeout / non-blocking-full / shutdown) leaves the
+			// queue unchanged, so there is nothing for a waiter to make progress on:
+			// the old `else { notify_all both conds }` blocks here were redundant
+			// over-signalling (verified correctness-neutral under ASan+TSan with
+			// exactly-once accounting). Shutdown wakeups come from end()/finish().
 			if (pushed) {
 				// Notifiy waiting thread it can push/pop now
 				_state->_pop_cond.notify_one();
-			} else {
-				// FIXME: This block shouldn't be needed!
-				// Signal the condition variable in case any threads are waiting
-				_state->_pop_cond.notify_all();
-				_state->_push_cond.notify_all();
 			}
 
 			return pushed;
@@ -282,11 +283,6 @@ namespace queue {
 			if (pushed) {
 				// Notifiy waiting thread it can push/pop now
 				_state->_pop_cond.notify_one();
-			} else {
-				// FIXME: This block shouldn't be needed!
-				// Signal the condition variable in case any threads are waiting
-				_state->_pop_cond.notify_all();
-				_state->_push_cond.notify_all();
 			}
 
 			return pushed;
@@ -308,11 +304,6 @@ namespace queue {
 					// Notifiy waiting thread it can push/pop now
 					_state->_push_cond.notify_one();
 				}
-			} else {
-				// FIXME: This block shouldn't be needed!
-				// Signal the condition variable in case any threads are waiting
-				_state->_pop_cond.notify_all();
-				_state->_push_cond.notify_all();
 			}
 
 			return popped;
@@ -329,11 +320,6 @@ namespace queue {
 					// Notifiy waiting thread it can push/pop now
 					_state->_push_cond.notify_one();
 				}
-			} else {
-				// FIXME: This block shouldn't be needed!
-				// Signal the condition variable in case any threads are waiting
-				_state->_pop_cond.notify_all();
-				_state->_push_cond.notify_all();
 			}
 
 			return popped;
@@ -351,11 +337,6 @@ namespace queue {
 			if (cleared) {
 				// Notifiy waiting thread it can push/pop now
 				_state->_push_cond.notify_one();
-			} else {
-				// FIXME: This block shouldn't be needed!
-				// Signal the condition variable in case any threads are waiting
-				_state->_pop_cond.notify_all();
-				_state->_push_cond.notify_all();
 			}
 		}
 
@@ -425,11 +406,6 @@ namespace queue {
 			if (pushed) {
 				// Notifiy waiting thread it can push/pop now
 				Queue_t::_state->_pop_cond.notify_one();
-			} else {
-				// FIXME: This block shouldn't be needed!
-				// Signal the condition variable in case any threads are waiting
-				Queue_t::_state->_pop_cond.notify_all();
-				Queue_t::_state->_push_cond.notify_all();
 			}
 
 			return pushed;
@@ -505,11 +481,6 @@ namespace queue {
 					// Notifiy waiting thread it can push/pop now
 					Queue_t::_state->_push_cond.notify_one();
 				}
-			} else {
-				// FIXME: This block shouldn't be needed!
-				// Signal the condition variable in case any threads are waiting
-				Queue_t::_state->_pop_cond.notify_all();
-				Queue_t::_state->_push_cond.notify_all();
 			}
 
 			return popped;
@@ -524,11 +495,6 @@ namespace queue {
 			if (cleared) {
 				// Notifiy waiting thread it can push/pop now
 				Queue_t::_state->_push_cond.notify_one();
-			} else {
-				// FIXME: This block shouldn't be needed!
-				// Signal the condition variable in case any threads are waiting
-				Queue_t::_state->_pop_cond.notify_all();
-				Queue_t::_state->_push_cond.notify_all();
 			}
 		}
 
