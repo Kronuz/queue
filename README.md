@@ -1,5 +1,7 @@
 # queue
 
+[![CI](https://github.com/Kronuz/queue/actions/workflows/ci.yml/badge.svg)](https://github.com/Kronuz/queue/actions/workflows/ci.yml)
+
 A thread-safe, bounded, blocking, **double-ended** MPMC queue. Header-only C++20.
 
 ## What it is
