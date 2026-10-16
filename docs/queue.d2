@@ -1,0 +1,26 @@
+# queue: a bounded, double-ended, blocking queue with timeouts and two-stage shutdown.
+# Render: d2 --layout elk --sketch --theme 302 docs/queue.d2 docs/queue.svg
+direction: right
+
+producers: Producers {
+  style.multiple: true
+  label: "push_front · push_back\n(timeout, force)"
+}
+
+q: Queue {
+  shape: queue
+  label: "std::deque under one mutex\nhard · soft limit · threshold"
+}
+
+consumers: Consumers {
+  style.multiple: true
+  label: "pop_front · pop_back\n(timeout)"
+}
+
+shutdown: Shutdown {
+  label: "end(): stop pushes, drain\nfinish(): wake all, stop"
+}
+
+producers -> q: "blocks when full"
+q -> consumers: "blocks when empty"
+shutdown -> q {style.stroke-dash: 3}

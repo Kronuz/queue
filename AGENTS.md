@@ -1,7 +1,8 @@
 # AGENTS.md
 
 Working notes for agents modifying this repository. For the design read
-`ARCHITECTURE.md`; for usage and the stability/perf numbers read `README.md`.
+`ARCHITECTURE.md`; for usage read `README.md`; for the stability and performance
+numbers read `docs/PERFORMANCE.md`.
 This file covers the repo layout, how to build and test (including under
 sanitizers), the invariants you must not break, and the traps.
 
@@ -15,7 +16,10 @@ benchmark/bench.cc            Throughput: queue vs mutex+condvar baseline vs moo
 third_party/concurrentqueue/  Vendored cameron314/concurrentqueue (header-only), for the benchmark only.
 CMakeLists.txt                INTERFACE library queue + alias queue::queue; test + sanitizer + bench targets, top-level only.
 LICENSE                       MIT, Copyright (c) 2015-2019 Dubalu LLC.
-README.md                     What it is, API, install, and the Stability & performance section (ASan/TSan + bench table + verdict).
+README.md                     What it is, install, quick start.
+docs/API.md                   The API reference.
+docs/PERFORMANCE.md           Sanitizer runs, the benchmark table, and the verdict.
+docs/queue.d2                 The README diagram's source (docs/queue.svg is rendered from it).
 ARCHITECTURE.md               Internal design: shared state, wait machinery, bound, shutdown.
 ```
 
@@ -55,7 +59,7 @@ $CXX -std=c++20 -fsanitize=thread  -g -O1 -I. test/concurrent.cc -o /tmp/tsan &&
 
 Both are expected to be **clean** (no leaks, no races, exit 0) with exact
 exactly-once accounting in every scenario. If you touch `queue.h`, re-run both;
-a regression here is the thing most worth catching. See `README.md` for the
+a regression here is the thing most worth catching. See `docs/PERFORMANCE.md` for the
 recorded baseline.
 
 ## Run the benchmark
@@ -93,15 +97,15 @@ produce a lost wakeup, a deadlock, or a torn read rather than a compile error.
   lock-free read is `count()` reading the atomic `_cnt`; it is approximate by
   design. Do not add any other unlocked access to the container.
 - **Notify after unlocking.** Every public op does `lk.unlock()` before it
-  notifies a condition variable (`queue.h:261`). Keep that order: notifying
+  notifies a condition variable. Keep that order: notifying
   while holding the lock makes the woken thread immediately re-block.
 - **The three timeout regimes.** `timeout < 0` blocks forever (via a 1s re-check
   loop), `timeout == 0` is non-blocking (predicate checked once, no wait),
   `timeout > 0` waits to a deadline. The dispatch hinges on `if (timeout)` then
-  `if (timeout > 0.0)` in `_push_wait`/`_pop_wait` (`queue.h:74`, `queue.h:101`).
+  `if (timeout > 0.0)` in `_push_wait`/`_pop_wait`.
   Changing this branch structure changes the public contract the tests pin down.
 - **`end()` drains, `finish()` stops.** `_pop_wait` fails on `_ending` only when
-  the queue is empty (`queue.h:116`) but fails on `_finished` immediately. Keep
+  the queue is empty but fails on `_finished` immediately. Keep
   that asymmetry: it is what lets `end()` mean "drain" and `finish()` mean "stop
   now."
 - **The block-forever wait re-checks periodically.** It is
