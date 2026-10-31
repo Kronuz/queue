@@ -1,8 +1,8 @@
 # AGENTS.md
 
 Working notes for agents modifying this repository. For the design read
-`ARCHITECTURE.md`; for usage read `README.md`; for the stability and performance
-numbers read `docs/PERFORMANCE.md`.
+`ARCHITECTURE.md`; for usage and the benchmark numbers read `README.md`; for
+what changed read `CHANGELOG.md`.
 This file covers the repo layout, how to build and test (including under
 sanitizers), the invariants you must not break, and the traps.
 
@@ -16,11 +16,11 @@ benchmark/bench.cc            Throughput: queue vs mutex+condvar baseline vs moo
 third_party/concurrentqueue/  Vendored cameron314/concurrentqueue (header-only), for the benchmark only.
 CMakeLists.txt                INTERFACE library queue + alias queue::queue; test + sanitizer + bench targets, top-level only.
 LICENSE                       MIT, Copyright (c) 2015-2019 Dubalu LLC.
-README.md                     What it is, install, quick start.
+README.md                     What it is, install, quick start, current benchmark numbers.
+CHANGELOG.md                  Dated changes, with earlier benchmark tables.
 docs/API.md                   The API reference.
-docs/PERFORMANCE.md           Sanitizer runs, the benchmark table, and the verdict.
 docs/queue.d2                 The README diagram's source (docs/queue.svg is rendered from it).
-ARCHITECTURE.md               Internal design: shared state, wait machinery, bound, shutdown.
+ARCHITECTURE.md               Internal design: shared state, wait machinery, bound, shutdown, stability.
 ```
 
 Everything ships in `queue.h`. There is no `.cc` to compile except the tests and
@@ -59,8 +59,8 @@ $CXX -std=c++20 -fsanitize=thread  -g -O1 -I. test/concurrent.cc -o /tmp/tsan &&
 
 Both are expected to be **clean** (no leaks, no races, exit 0) with exact
 exactly-once accounting in every scenario. If you touch `queue.h`, re-run both;
-a regression here is the thing most worth catching. See `docs/PERFORMANCE.md` for the
-recorded baseline.
+a regression here is the thing most worth catching. ARCHITECTURE.md's Stability
+section records the expected result.
 
 ## Run the benchmark
 
@@ -82,9 +82,8 @@ It prints a Mitems/sec table (impl x thread shape). Always build it `-O3
   add a third-party or Xapiand header. (`third_party/concurrentqueue` exists only
   to give the benchmark something to compare against; the library never includes
   it.)
-- **Verbatim from Xapiand.** Unlike `stash.h`, this file had nothing to decouple.
-  Keep changes minimal and clearly separated from the upstream so they can be
-  reconciled. Prefer fixing things upstream in Xapiand over diverging here.
+- **Xapiand consumes this repository.** Xapiand fetches this library at `main`,
+  so a change here ships to Xapiand. Record behavior changes in CHANGELOG.md.
 - Double quotes in code; no em dashes in prose.
 
 ## Load-bearing invariants
@@ -99,19 +98,23 @@ produce a lost wakeup, a deadlock, or a torn read rather than a compile error.
 - **Notify after unlocking.** Every public op does `lk.unlock()` before it
   notifies a condition variable. Keep that order: notifying
   while holding the lock makes the woken thread immediately re-block.
-- **The three timeout regimes.** `timeout < 0` blocks forever (via a 1s re-check
-  loop), `timeout == 0` is non-blocking (predicate checked once, no wait),
-  `timeout > 0` waits to a deadline. The dispatch hinges on `if (timeout)` then
-  `if (timeout > 0.0)` in `_push_wait`/`_pop_wait`.
+- **The three timeout regimes.** A satisfied predicate returns at once.
+  Otherwise `timeout < 0` blocks in `wait(lk, pred)`, `timeout == 0` returns
+  false, and `timeout > 0` waits to a deadline. The dispatch hinges on
+  `if (timeout)` then `if (timeout > 0.0)` in `_push_wait`/`_pop_wait`.
   Changing this branch structure changes the public contract the tests pin down.
 - **`end()` drains, `finish()` stops.** `_pop_wait` fails on `_ending` only when
   the queue is empty but fails on `_finished` immediately. Keep
   that asymmetry: it is what lets `end()` mean "drain" and `finish()` mean "stop
   now."
-- **The block-forever wait re-checks periodically.** It is
-  `while (!wait_for(1s, pred)) {}`, not a bare `wait`. Do not "simplify" it to an
-  unbounded wait; the periodic re-check is the guard against a lost notification
-  wedging a thread.
+- **Count every blocked waiter.** Each blocking branch increments
+  `_pop_waiters`/`_push_waiters` before the wait and decrements it after, under
+  the mutex. A notifier skips the condition variable when the count is zero, so
+  an uncounted waiter misses its wake-up and an untimed one hangs.
+  `test/concurrent.cc`'s all-untimed scenario catches this.
+- **Shutdown locks before it broadcasts.** `_wake_all()` takes and releases the
+  mutex before notifying. Untimed waits have no periodic re-check, so dropping
+  that empty critical section can lose the shutdown wake-up.
 
 ## Traps
 
@@ -119,13 +122,9 @@ produce a lost wakeup, a deadlock, or a torn read rather than a compile error.
   `clear` subtracts. `count()`, the bound check, and the destructor's
   `_cnt -= size` all rely on it staying in step with the container. An asymmetric
   edit desyncs the bound silently.
-- **The failure-path over-signalling was removed (was the `FIXME` blocks).** Every op's
-  failure path used to `notify_all()` both condition variables (the
-  `FIXME: This block shouldn't be needed!` blocks). It was redundant: a failed push/pop
-  changes no state, so no waiter can make progress, and shutdown wakeups already come from
-  `end()`/`finish()`. Removed and verified correctness-neutral under ASan **and** TSan
-  (`test/concurrent.cc`, exact exactly-once accounting in every scenario). Do NOT re-add a
-  failure-path notify; only a *successful* op notifies now.
+- **Only a successful op notifies.** A failed push or pop changes no state, so no
+  waiter can make progress, and shutdown wake-ups come from `end()`/`finish()`.
+  Do not add a failure-path notify.
 - **`force` bypasses the bound.** `push_*(..., force=true)` skips the wait and
   the capacity check entirely, so it can push past `_hard_limit`. That is by
   design; just know it sidesteps back-pressure.
@@ -135,11 +134,9 @@ produce a lost wakeup, a deadlock, or a torn read rather than a compile error.
 
 ## Standalone vs. Xapiand
 
-This is a verbatim extraction of `queue.h` from
-[Xapiand](https://github.com/Kronuz/Xapiand), where it backs the thread pools,
-the async logger hand-off, and other producer/consumer pipelines. It has zero
-local includes (pure `std`), so unlike the `stash` extraction there was no
-`log.h` dependency to replace and no trace hooks to inject. The file is copied
-as-is, license header included. It belongs to the same concurrency family as
+`queue.h` comes from [Xapiand](https://github.com/Kronuz/Xapiand), where it backs
+the thread pools, the async logger hand-off, and other producer/consumer
+pipelines. It has zero local includes (pure `std`), so unlike `stash` it needs
+no `log.h` replacement and no trace hooks. It belongs to the same concurrency family as
 [`stash`](https://github.com/Kronuz/stash) and the scheduler/thread-pool built
 on it.

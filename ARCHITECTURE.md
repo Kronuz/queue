@@ -12,10 +12,10 @@ variables so producers and consumers can wait on independent conditions. It is
 double-ended, optionally bounded, and supports per-operation timeouts and a
 two-stage graceful shutdown.
 
-The design is deliberately conventional. There is no lock-free cleverness here;
-the value is in the feature surface (both ends, timeouts, bounds, finish), not
-in the synchronization. Everything mutable lives behind one mutex, which is what
-makes it trivially race-free and also what caps its throughput.
+The design is conventional, with no lock-free code. The value is in the
+feature surface: both ends, timeouts, bounds, and a two-stage finish.
+Everything mutable lives behind one mutex, which makes it race-free by
+construction and caps its throughput.
 
 ## Shared state: `QueueState`
 
@@ -31,7 +31,12 @@ copies that share it:
 - `std::condition_variable _push_cond` — producers wait here for room; consumers
   notify it when the queue drains below `_threshold`.
 - `std::atomic_size_t _cnt` — the live item count, kept alongside the container
-  so `count()` can be read without taking the lock.
+  so `count()` can be read without taking the lock. It changes only under the
+  mutex, so `_cnt_add` and `_cnt_sub` use a relaxed load plus a store instead of
+  a locked read-modify-write.
+- `size_t _pop_waiters`, `_push_waiters` — the number of threads blocked in a
+  pop or push wait. They change only under the mutex and let a notifier skip
+  the condition-variable call when nobody waits.
 
 The state is held by `std::shared_ptr`, so several `Queue`
 objects can share one `QueueState`. The two-arg constructor
@@ -52,17 +57,19 @@ through one of them while holding a `std::unique_lock` on the mutex.
 ### `_push_wait(timeout, lk)`
 
 The predicate is "the queue is shutting down, or there is room":
-`_finished || _ending || _cnt < _hard_limit`. The timeout argument selects one
-of three behaviors:
+`_finished || _ending || _cnt < _hard_limit`. If it already holds, the wait is
+skipped, with no clock read. Otherwise the timeout argument selects one of
+three behaviors:
 
-- **`timeout == 0`** (the `else` branch): non-blocking. Evaluate
-  the predicate once; if it is false, return false immediately. No waiting.
+- **`timeout == 0`**: non-blocking. Return false immediately.
 - **`timeout > 0`**: compute `now + timeout` and
   `wait_until(lk, deadline, pred)`. If the deadline passes with the predicate
   still false, return false.
-- **`timeout < 0`** (still inside `if (timeout)` since the value is non-zero): block forever, implemented as
-  `while (!wait_for(lk, 1s, pred)) {}` — a one-second re-check loop rather than
-  an unbounded `wait`, so a missed notification cannot wedge it permanently.
+- **`timeout < 0`**: block until the predicate holds, with
+  `wait(lk, pred)` and no clock read.
+
+Both blocking branches increment `_push_waiters` before the wait and decrement
+it after.
 
 After the wait, if the queue is finished or ending it returns false; otherwise it returns `_cnt < _soft_limit`. With
 the default limits (`hard == soft == SIZE_MAX`) the soft check is always true,
@@ -72,8 +79,8 @@ so an unbounded push always succeeds once it is not shutting down.
 
 Mirror image. The predicate is "shutting down, or there is an item":
 `_finished || _ending || !_items_queue.empty()`, with the same three timeout
-behaviors. After the wait it returns false if `_finished`, or if `_ending` and
-the queue is empty — so an `end()`ing queue still drains its
+behaviors and the same `_pop_waiters` count. After the wait it returns false if
+`_finished`, or if `_ending` and the queue is empty — so an `end()`ing queue still drains its
 remaining items before pops start failing, while a `finish()`ed queue fails
 immediately even with items left.
 
@@ -85,20 +92,19 @@ representative):
 1. Take a `std::unique_lock` on the mutex.
 2. Call the `_*_impl` helper, which runs the wait and, on success, mutates the
    container and bumps `_cnt`.
-3. `lk.unlock()` explicitly.
-4. Notify a condition variable based on the result.
+3. Decide under the lock whether to wake anyone.
+4. `lk.unlock()` explicitly.
+5. Notify a condition variable if step 3 said so.
 
-On a successful push it does `_pop_cond.notify_one()` — wake one waiting
-consumer. On a successful pop it does `_push_cond.notify_one()`, but **only if**
-the post-pop size dropped below `_threshold`, so a queue held
-near its bound does not wake producers it will only re-block.
+A successful push does `_pop_cond.notify_one()` when `_pop_waiters` is
+non-zero. A successful pop does `_push_cond.notify_one()` when `_push_waiters`
+is non-zero **and** the post-pop size is below `_threshold`, so a queue held near
+its bound does not wake producers it will only re-block. An unbounded queue
+never has a blocked pusher, so its pops never touch `_push_cond`.
 
-A **failed** op (a full or empty timeout, or a shutdown) notifies nothing: it
-changed no state, so no waiter can make progress, and shutdown wakeups come from
-`end()` and `finish()`, which broadcast on both condition variables. (Until
-`bc16081` every failure path broadcast on both, the source's `FIXME` blocks; that
-over-signalling was removed, checked under ASan and TSan with exactly-once
-accounting.)
+A **failed** op (a full or empty timeout, or a shutdown) notifies nothing. It
+changes no state, so no waiter can make progress. Shutdown wake-ups come from
+`end()` and `finish()`.
 
 `push_back` / `push_front` differ only in which end of the deque they touch;
 likewise `pop_back` / `pop_front`. `push`/`pop` are aliases for the back/front
@@ -136,11 +142,13 @@ Two stages, two atomics:
   immediately, even with items still queued. This is the hard stop.
 
 Both are idempotent (they early-out if the flag is already set) and `noexcept`.
-Because the wait predicates test these flags, flipping one and broadcasting
-wakes every parked thread, which re-checks its predicate and returns false. The
-destructor calls `finish()` after subtracting the remaining
-items from `_cnt`, so tearing down a queue releases any thread still blocked on
-it.
+Both call `_wake_all()`, which locks and unlocks the mutex and then broadcasts on
+both condition variables. A waiter holds the mutex from its predicate check
+until it is inside `wait()`, so the empty critical section orders the flag store
+before that waiter blocks and the broadcast cannot be lost. Every parked thread
+wakes, re-checks its predicate, and returns false. The destructor takes the
+mutex, subtracts the remaining items from `_cnt`, and runs `_finish_locked()`,
+so tearing down a queue releases any thread still blocked on it.
 
 ## Move, copy, lifetime
 
@@ -161,30 +169,39 @@ under the same lock.
 - **One mutex, all shared mutation behind it.** The container and `_cnt` are
   only ever touched while holding `_state->_mutex`. `count()`'s lock-free read
   of the atomic `_cnt` is the single exception, and it is safe because the read
-  is atomic and only ever approximate. This is why the structure is trivially
-  race-free: ASan and TSan are clean because there is nothing to race on outside
-  the lock (see [docs/PERFORMANCE.md](docs/PERFORMANCE.md)).
-- **Notify after unlock.** Every public op unlocks before it notifies, so a woken thread does not immediately re-block on a lock the
-  notifier still holds. This is a standard condition-variable optimization and a
-  correctness aid, not just a perf one.
-- **The block-forever loop re-checks every second.** A `timeout < 0` wait is
-  `while (!wait_for(1s, pred)) {}`, not a bare `wait`. A lost wakeup costs at
-  most a one-second latency, never a permanent hang.
+  is atomic and only ever approximate. There is nothing to race on outside the
+  lock.
+- **Notify after unlock.** Every public op unlocks before it notifies, so a
+  woken thread does not immediately re-block on a lock the notifier still holds.
+- **Notify only a counted waiter.** The waiter counts and the wake decision are
+  read under the mutex, so a skipped notify never strands a blocked thread.
+- **Untimed waits have no timeout.** A `timeout < 0` wait is a bare
+  `wait(lk, pred)`. It relies on every state change that can satisfy a predicate
+  either notifying a counted waiter or, for shutdown, locking the mutex before
+  the broadcast.
 - **`force` bypasses the bound.** `push_*(elem, timeout, force=true)` skips the
   wait and the capacity check. It can push past `_hard_limit`; that is the
   caller's responsibility.
 
-The cost of this model is throughput: a single lock serializes every producer
-and consumer. [docs/PERFORMANCE.md](docs/PERFORMANCE.md) measures it. The structure
-trades raw items/sec for a feature set (double-ended, timeouts, bounds,
-graceful finish) that lock-free queues do not provide.
+A single lock serializes every producer and consumer. The README's Performance
+section measures the single-ended path against a plain mutex queue and
+moodycamel's blocking queue.
+
+## Stability
+
+`test/concurrent.cc` runs 4x4 and 8x8 producer/consumer shapes through
+unbounded, bounded, `finish()`-mid-flight, shutdown-race, and all-untimed
+scenarios. It checks that every item arrives exactly once with a count plus an
+XOR checksum over the id space; a watchdog fails a hung run. Built with Homebrew
+LLVM 22, it runs clean under ASan (1,000,000 items: no leaks, no heap
+corruption, no use-after-free) and TSan (200,000 items: no data races), with
+nothing suppressed. AGENTS.md has the commands.
 
 ## Standalone vs. Xapiand
 
-This is an extraction of `queue.h` from
-[Xapiand](https://github.com/Kronuz/Xapiand). Unlike `stash.h`, `queue.h` has no
-dependency on Xapiand's `log.h` or any other local header — its includes are
-pure `std` (`<atomic>`, `<condition_variable>`, `<deque>`, `<list>`, `<mutex>`,
-`<unordered_map>`, and friends). So there was nothing to decouple. Since the extraction it has dropped the
-failure-path over-signalling (`bc16081`); Xapiand now fetches this library at
-`main`, so it runs the same code.
+`queue.h` comes from [Xapiand](https://github.com/Kronuz/Xapiand). Unlike
+`stash.h`, it has no dependency on Xapiand's `log.h` or any other local header;
+its includes are pure `std` (`<atomic>`, `<condition_variable>`, `<deque>`,
+`<list>`, `<mutex>`, `<unordered_map>`, and friends). Xapiand fetches this
+library at `main`, so both run the same code. CHANGELOG.md lists how the wake-up
+path differs from the original.

@@ -9,8 +9,7 @@ Part of [Kronuz C++ Libraries](https://github.com/Kronuz/cpp-libraries), a colle
 
 A thread-safe, bounded, blocking, double-ended queue for C++20: push and pop at
 either end, wait with a per-call timeout, and shut down in two stages. For
-hand-off channels between threads where back-pressure and a clean shutdown
-matter more than raw throughput.
+hand-off channels between threads that need back-pressure and a clean shutdown.
 
 ![queue: producers and consumers at either end of one bounded deque, with two-stage shutdown](docs/queue.svg)
 
@@ -74,18 +73,35 @@ the shape Xapiand uses.
 
 - ✅ A blocking channel that needs timeouts, both ends, a bound, or a clean
   shutdown.
-- ❌ A raw single-ended throughput pipe: a plain mutex-and-deque queue, or a
-  lock-free one, moves more items per second
-  ([docs/PERFORMANCE.md](docs/PERFORMANCE.md)).
+- ❌ A caller that cannot take a lock, such as a signal handler or a real-time
+  thread: every call locks one mutex.
+
+## ⚡ Performance
+
+`benchmark/bench.cc` times the single-ended MPMC path (`push_back` /
+`pop_front`): 2,000,000 items, best of 3, million items/sec, Apple arm64.
+
+| | 1x1 | 2x2 | 4x4 | 8x8 |
+|---|---|---|---|---|
+| `queue::Queue<int>` | 44.8 | 15.2 | 19.5 | 30.6 |
+| mutex+condvar+deque | 33.5 | 15.4 | 14.7 | 19.3 |
+| moodycamel `BlockingConcurrentQueue` | 8.5 | 8.5 | 6.1 | 5.0 |
+
+The comparison covers only the shared subset: moodycamel has no `pop_back`, no
+per-call deadline, and no `end()` or `finish()`.
+
+```sh
+cmake -B build -DCMAKE_CXX_COMPILER=$(brew --prefix llvm)/bin/clang++
+cmake --build build --target queue_bench && ./build/queue_bench
+```
 
 ## 📚 Documentation
 
 - [docs/API.md](docs/API.md): every call, its timeout rule, and `QueueSet`.
 - [ARCHITECTURE.md](ARCHITECTURE.md): the state, the limits, the waits, and the
   shutdown model.
-- [docs/PERFORMANCE.md](docs/PERFORMANCE.md): the sanitizer runs and the
-  benchmark against a baseline and moodycamel.
 - [AGENTS.md](AGENTS.md): repository map, invariants, and traps.
+- [CHANGELOG.md](CHANGELOG.md): what changed, with the earlier benchmark numbers.
 
 ## 🛠️ Building and testing
 
