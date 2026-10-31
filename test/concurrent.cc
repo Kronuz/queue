@@ -26,6 +26,7 @@
 // so a crash can never be miscounted as a pass by a grep-for-FAIL harness.
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -203,6 +204,53 @@ static bool run_shutdown_race(int iters) {
 	return true;
 }
 
+// Untimed poppers parked on an empty queue must each be woken by a push. With
+// every popper untimed there is no timeout to mask a push that skips the notify
+// (e.g. an untimed waiter that is not counted), so a missed wake-up hangs; a
+// watchdog turns the hang into a FAIL. Items are pushed one at a time with the
+// poppers given time to park, then exactly-once is checked.
+static bool run_untimed_wake(int iters) {
+	std::atomic<long> progress{0};
+	std::atomic<bool> done{false};
+	std::thread watchdog([&] {
+		long last = -1;
+		for (;;) {
+			for (int i = 0; i < 80 && !done; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+			if (done) return;
+			long p = progress.load();
+			if (p == last) {
+				static const char msg[] = "  FAIL untimed wake: hang (lost wake-up)\n  RESULT: FAIL\n";
+				ssize_t r = ::write(STDOUT_FILENO, msg, sizeof(msg) - 1);
+				(void)r;
+				_Exit(3);
+			}
+			last = p;
+		}
+	});
+	bool ok = true;
+	for (int it = 0; it < iters && ok; ++it) {
+		queue::Queue<int> q;
+		std::atomic<int> got{0};
+		const int nc = 1 + it % 4, n = 50;
+		std::vector<std::thread> ts;
+		for (int i = 0; i < nc; ++i) ts.emplace_back([&] { int v; while (q.pop_front(v)) ++got; });
+		for (int k = 0; k < n; ++k) {
+			q.push_back(k);
+			if (k % 7 == 0) std::this_thread::yield();
+			if (k % 16 == 0) std::this_thread::sleep_for(std::chrono::microseconds(200));
+		}
+		while (got < n) std::this_thread::yield();
+		q.end();
+		for (auto& t : ts) t.join();
+		ok = got == n;
+		++progress;
+	}
+	done = true;
+	watchdog.join();
+	std::printf("  untimed wake x%d: %s\n", iters, ok ? "OK" : "FAIL");
+	return ok;
+}
+
 int main(int argc, char** argv) {
 	std::setvbuf(stdout, nullptr, _IONBF, 0);
 	std::signal(SIGSEGV, crash_handler);
@@ -216,6 +264,9 @@ int main(int argc, char** argv) {
 	std::printf("queue concurrent stress (total=%llu items)\n", (unsigned long long)total);
 
 	bool ok = true;
+	// First: a missed wake-up of an untimed waiter turns into a watchdog FAIL here
+	// instead of a hang in a later scenario.
+	ok &= run_untimed_wake(1500);
 	// Unbounded MPMC at two thread shapes.
 	ok &= run_mpmc("unbounded 4x4", 4, 4, total, /*cap*/ 0);
 	ok &= run_mpmc("unbounded 8x8", 8, 8, total, /*cap*/ 0);
