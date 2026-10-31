@@ -48,6 +48,28 @@ shouldn't be needed!` blocks in `queue.h`). Under contention that extra
 signalling is the bulk of the gap. The baseline does one `notify_one` and
 touches nothing else.
 
+## Wake-up cost (perf pass)
+
+Throughput on an Apple arm64 host, Mitems/s, 1x1 / 2x2 / 4x4 / 8x8 (best of 3):
+
+| | 1x1 | 2x2 | 4x4 | 8x8 |
+|---|---|---|---|---|
+| `Queue` before | 12.8 | 5.1 | 6.5 | 9.4 |
+| `Queue` now | 44.8 | 15.2 | 19.5 | 30.6 |
+| mutex+condvar+deque | 33.5 | 15.4 | 14.7 | 19.3 |
+| moodycamel Blocking | 8.5 | 8.5 | 6.1 | 5.0 |
+
+How: the state counts blocked poppers and pushers under the mutex, and a
+push/pop only calls `notify_one` when the matching count is non-zero. An
+unbounded queue never has a blocked pusher, so pops never touch `_push_cond`.
+A blocking wait with no timeout uses `wait(lk, pred)` (no 1 s polling, no clock
+read) and skips the wait entirely when the predicate already holds. Without
+polling, `end()`/`finish()` lock and unlock the mutex before notifying, so a
+waiter between its predicate check and its block cannot miss the shutdown.
+`_cnt` is only written under the mutex, so it uses load+store instead of a
+locked read-modify-write. TSan (clang, Linux x86_64) is clean on the stress
+test, which now includes a shutdown-race loop.
+
 ## Verdict
 
 **Keep it, but note the cost.** The mutex+condvar approach is stable (ASan/TSan

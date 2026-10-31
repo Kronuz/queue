@@ -178,6 +178,31 @@ static bool run_finish_midflight(int nprod, int ncons) {
 	return ok;
 }
 
+// Shutdown must never be lost: with no polling, a waiter that races end() or
+// finish() between its predicate check and blocking would sleep forever.
+static bool run_shutdown_race(int iters) {
+	for (int i = 0; i < iters; ++i) {
+		queue::Queue<int> q(1);  // hard limit 1: pushers can block too
+		std::atomic<int> returned{0};
+		std::vector<std::thread> ts;
+		for (int t = 0; t < 2; ++t) {
+			ts.emplace_back([&] { int v; q.pop_front(v); ++returned; });
+			ts.emplace_back([&] { q.push_back(1); q.push_back(2); q.push_back(3); ++returned; });
+		}
+		if (i & 1) { q.finish(); } else { q.end(); }
+		auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+		while (returned < 4 && std::chrono::steady_clock::now() < deadline) {
+			std::this_thread::yield();
+		}
+		bool done = returned == 4;
+		if (!done) { q.finish(); }
+		for (auto& t : ts) t.join();
+		if (!done) { std::printf("  FAIL shutdown race: waiter lost wake-up (iter %d)\n", i); return false; }
+	}
+	std::printf("  shutdown race x%d: OK\n", iters);
+	return true;
+}
+
 int main(int argc, char** argv) {
 	std::setvbuf(stdout, nullptr, _IONBF, 0);
 	std::signal(SIGSEGV, crash_handler);
@@ -197,6 +222,7 @@ int main(int argc, char** argv) {
 	// Bounded MPMC: a small cap forces producers to park on a full queue.
 	ok &= run_mpmc("bounded(64) 4x4", 4, 4, total, /*cap*/ 64);
 	ok &= run_mpmc("bounded(16) 8x8", 8, 8, total, /*cap*/ 16);
+	ok &= run_shutdown_race(2000);
 	// finish() mid-flight.
 	ok &= run_finish_midflight(4, 4);
 	ok &= run_finish_midflight(8, 8);

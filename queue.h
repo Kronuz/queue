@@ -51,6 +51,17 @@ namespace queue {
 		std::condition_variable _push_cond;
 		std::atomic_size_t _cnt;
 
+		// Threads blocked in a pop / push wait. Only touched with _mutex held, so
+		// a notifier can skip the condvar call (a futex-class operation) when
+		// nobody is waiting.
+		size_t _pop_waiters = 0;
+		size_t _push_waiters = 0;
+
+		// _cnt is only modified with _mutex held; the atomic exists for the
+		// lock-free count() read, so plain load+store beats a locked RMW.
+		void _cnt_add(size_t n) noexcept { _cnt.store(_cnt.load(std::memory_order_relaxed) + n); }
+		void _cnt_sub(size_t n) noexcept { _cnt.store(_cnt.load(std::memory_order_relaxed) - n); }
+
 		QueueState(size_t hard_limit=-1, size_t soft_limit=-1, size_t threshold=-1)
 			: _hard_limit(hard_limit),
 			  _soft_limit(soft_limit),
@@ -72,19 +83,26 @@ namespace queue {
 			auto push_wait_pred = [this]() {
 				return _finished || _ending || _state->_cnt < _state->_hard_limit;
 			};
-			if (timeout) {
+			if (push_wait_pred()) {
+				// Already satisfied: no waiting, no clock read.
+			} else if (timeout) {
 				if (timeout > 0.0) {
 					auto timeout_tp = std::chrono::steady_clock::now() + std::chrono::duration<double>(timeout);
-					if (!_state->_push_cond.wait_until(lk, timeout_tp, push_wait_pred)) {
+					++_state->_push_waiters;
+					bool ok = _state->_push_cond.wait_until(lk, timeout_tp, push_wait_pred);
+					--_state->_push_waiters;
+					if (!ok) {
 						return false;
 					}
 				} else {
-					while (!_state->_push_cond.wait_for(lk, 1s, push_wait_pred)) {}
+					// No deadline, so no clock read. end()/finish() take the
+					// mutex before notifying, so no wake-up can be lost.
+					++_state->_push_waiters;
+					_state->_push_cond.wait(lk, push_wait_pred);
+					--_state->_push_waiters;
 				}
 			} else {
-				if (!push_wait_pred()) {
-					return false;
-				}
+				return false;
 			}
 
 			if (_finished || _ending) {
@@ -99,19 +117,26 @@ namespace queue {
 				// While the queue is empty, make the thread that runs this wait
 				return _finished || _ending || !_items_queue.empty();
 			};
-			if (timeout) {
+			if (pop_wait_pred()) {
+				// Already satisfied: no waiting, no clock read.
+			} else if (timeout) {
 				if (timeout > 0.0) {
 					auto timeout_tp = std::chrono::steady_clock::now() + std::chrono::duration<double>(timeout);
-					if (!_state->_pop_cond.wait_until(lk, timeout_tp, pop_wait_pred)) {
+					++_state->_pop_waiters;
+					bool ok = _state->_pop_cond.wait_until(lk, timeout_tp, pop_wait_pred);
+					--_state->_pop_waiters;
+					if (!ok) {
 						return false;
 					}
 				} else {
-					while (!_state->_pop_cond.wait_for(lk, 1s, pop_wait_pred)) {}
+					// No deadline, so no clock read. end()/finish() take the
+					// mutex before notifying, so no wake-up can be lost.
+					++_state->_pop_waiters;
+					_state->_pop_cond.wait(lk, pop_wait_pred);
+					--_state->_pop_waiters;
 				}
 			} else {
-				if (!pop_wait_pred()) {
-					return false;
-				}
+				return false;
 			}
 
 			if (_finished || (_ending && _items_queue.empty())) {
@@ -127,7 +152,7 @@ namespace queue {
 			if (ret) {
 				// Insert the element in the queue
 				_items_queue.push_front(std::forward<E>(element));
-				++_state->_cnt;
+				_state->_cnt_add(1);
 			}
 			return ret;
 		}
@@ -138,7 +163,7 @@ namespace queue {
 			if (ret) {
 				// Insert the element in the queue
 				_items_queue.push_back(std::forward<E>(element));
-				++_state->_cnt;
+				_state->_cnt_add(1);
 			}
 			return ret;
 		}
@@ -152,7 +177,7 @@ namespace queue {
 				//pop the element
 				_items_queue.pop_back();
 				assert(_state->_cnt > 0);
-				--_state->_cnt;
+				_state->_cnt_sub(1);
 			}
 			return ret;
 		}
@@ -166,7 +191,7 @@ namespace queue {
 				//pop the element
 				_items_queue.pop_front();
 				assert(_state->_cnt > 0);
-				--_state->_cnt;
+				_state->_cnt_sub(1);
 			}
 			return ret;
 		}
@@ -175,13 +200,33 @@ namespace queue {
 			auto size = _items_queue.size();
 			_items_queue.clear();
 			assert(_state->_cnt >= size);
-			_state->_cnt -= size;
+			_state->_cnt_sub(size);
 
 			if (_finished || _ending) {
 				return false;
 			}
 
 			return true;
+		}
+
+		// Wake every waiter. The empty critical section orders the flag store
+		// before any waiter that has already evaluated its predicate but not yet
+		// blocked: that waiter holds the mutex until it is inside wait(), so
+		// after this lock/unlock pair the notify cannot be lost.
+		void _wake_all() noexcept {
+			{ std::lock_guard<std::mutex> lk(_state->_mutex); }
+			_state->_pop_cond.notify_all();
+			_state->_push_cond.notify_all();
+		}
+
+		// finish() for callers already holding the mutex (the destructor).
+		void _finish_locked() noexcept {
+			if (_finished) {
+				return;
+			}
+			_finished = true;
+			_state->_pop_cond.notify_all();
+			_state->_push_cond.notify_all();
 		}
 
 	public:
@@ -227,8 +272,8 @@ namespace queue {
 				std::lock_guard<std::mutex> lk(_state->_mutex);
 				auto size = _items_queue.size();
 				assert(_state->_cnt >= size);
-				_state->_cnt -= size;
-				finish();
+				_state->_cnt_sub(size);
+				_finish_locked();
 			}
 		}
 
@@ -237,11 +282,7 @@ namespace queue {
 				return;
 			}
 			_ending = true;
-
-			// Signal the condition variable in case any threads are waiting
-			_state->_pop_cond.notify_all();
-			_state->_push_cond.notify_all();
-
+			_wake_all();
 		}
 
 		void finish() noexcept {
@@ -249,16 +290,14 @@ namespace queue {
 				return;
 			}
 			_finished = true;
-
-			// Signal the condition variable in case any threads are waiting
-			_state->_pop_cond.notify_all();
-			_state->_push_cond.notify_all();
+			_wake_all();
 		}
 
 		template<typename E>
 		bool push_back(E&& element, double timeout = -1.0, bool force = false) {
 			std::unique_lock<std::mutex> lk(_state->_mutex);
 			bool pushed = _push_back_impl(std::forward<E>(element), timeout, lk, force);
+			bool wake = pushed && _state->_pop_waiters;
 			lk.unlock();
 
 			// Only a successful op changes queue state, so only it notifies. A
@@ -267,7 +306,7 @@ namespace queue {
 			// the old `else { notify_all both conds }` blocks here were redundant
 			// over-signalling (verified correctness-neutral under ASan+TSan with
 			// exactly-once accounting). Shutdown wakeups come from end()/finish().
-			if (pushed) {
+			if (wake) {
 				// Notifiy waiting thread it can push/pop now
 				_state->_pop_cond.notify_one();
 			}
@@ -279,9 +318,10 @@ namespace queue {
 		bool push_front(E&& element, double timeout = -1.0, bool force = false) {
 			std::unique_lock<std::mutex> lk(_state->_mutex);
 			bool pushed = _push_front_impl(std::forward<E>(element), timeout, lk, force);
+			bool wake = pushed && _state->_pop_waiters;
 			lk.unlock();
 
-			if (pushed) {
+			if (wake) {
 				// Notifiy waiting thread it can push/pop now
 				_state->_pop_cond.notify_one();
 			}
@@ -297,14 +337,12 @@ namespace queue {
 		bool pop_back(T& element, double timeout=-1.0) {
 			std::unique_lock<std::mutex> lk(_state->_mutex);
 			bool popped = _pop_back_impl(element, timeout, lk);
-			auto size = _items_queue.size();
+			bool wake = popped && _state->_push_waiters && _items_queue.size() < _state->_threshold;
 			lk.unlock();
 
-			if (popped) {
-				if (size < _state->_threshold) {
-					// Notifiy waiting thread it can push/pop now
-					_state->_push_cond.notify_one();
-				}
+			if (wake) {
+				// Notifiy waiting thread it can push/pop now
+				_state->_push_cond.notify_one();
 			}
 
 			return popped;
@@ -313,14 +351,12 @@ namespace queue {
 		bool pop_front(T& element, double timeout=-1.0) {
 			std::unique_lock<std::mutex> lk(_state->_mutex);
 			bool popped = _pop_front_impl(element, timeout, lk);
-			auto size = _items_queue.size();
+			bool wake = popped && _state->_push_waiters && _items_queue.size() < _state->_threshold;
 			lk.unlock();
 
-			if (popped) {
-				if (size < _state->_threshold) {
-					// Notifiy waiting thread it can push/pop now
-					_state->_push_cond.notify_one();
-				}
+			if (wake) {
+				// Notifiy waiting thread it can push/pop now
+				_state->_push_cond.notify_one();
 			}
 
 			return popped;
@@ -332,7 +368,7 @@ namespace queue {
 
 		void clear() {
 			std::unique_lock<std::mutex> lk(_state->_mutex);
-			bool cleared = _clear_impl(lk);
+			bool cleared = _clear_impl(lk) && _state->_push_waiters;
 			lk.unlock();
 
 			if (cleared) {
@@ -402,9 +438,10 @@ namespace queue {
 				_items_map[*first] = first;
 			}
 
+			bool wake = pushed && Queue_t::_state->_pop_waiters;
 			lk.unlock();
 
-			if (pushed) {
+			if (wake) {
 				// Notifiy waiting thread it can push/pop now
 				Queue_t::_state->_pop_cond.notify_one();
 			}
@@ -435,7 +472,7 @@ namespace queue {
 						Queue_t::_items_queue.erase(it->second);
 						_items_map.erase(it);
 						assert(Queue_t::_state->_cnt > 0);
-						--Queue_t::_state->_cnt;
+						Queue_t::_state->_cnt_sub(1);
 						break;
 				}
 			}
@@ -457,7 +494,7 @@ namespace queue {
 				Queue_t::_items_queue.erase(it->second);
 				_items_map.erase(it);
 				assert(Queue_t::_state->_cnt > 0);
-				--Queue_t::_state->_cnt;
+				Queue_t::_state->_cnt_sub(1);
 			}
 			return _push(std::forward<E>(element), timeout, lk);
 		}
@@ -473,15 +510,14 @@ namespace queue {
 				}
 			}
 
-			auto size = Queue_t::_items_queue.size();
+			bool wake = popped && Queue_t::_state->_push_waiters &&
+				Queue_t::_items_queue.size() < Queue_t::_state->_threshold;
 
 			lk.unlock();
 
-			if (popped) {
-				if (size < Queue_t::_state->_threshold) {
-					// Notifiy waiting thread it can push/pop now
-					Queue_t::_state->_push_cond.notify_one();
-				}
+			if (wake) {
+				// Notifiy waiting thread it can push/pop now
+				Queue_t::_state->_push_cond.notify_one();
 			}
 
 			return popped;
@@ -489,7 +525,7 @@ namespace queue {
 
 		void clear() {
 			std::lock_guard<std::mutex> lk(Queue_t::_state->_mutex);
-			bool cleared = Queue_t::_clear_impl(lk);
+			bool cleared = Queue_t::_clear_impl(lk) && Queue_t::_state->_push_waiters;
 
 			_items_map.clear();
 
@@ -508,7 +544,7 @@ namespace queue {
 			Queue_t::_items_queue.erase(it->second);
 			_items_map.erase(it);
 			assert(Queue_t::_state->_cnt > 0);
-			--Queue_t::_state->_cnt;
+			Queue_t::_state->_cnt_sub(1);
 			return 1;
 		}
 	};
