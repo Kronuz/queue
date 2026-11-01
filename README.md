@@ -95,40 +95,46 @@ Not for:
 [`queue_bench`](benchmark/bench.cc) moves 2,000,000 integers through one queue with
 `push_back` and `pop_front`: the producers hand the ids out between them, and each consumer
 pops its share of the items. Every run checks that the consumers received each item exactly
-once (the sum of the ids), so the queues compared deliver the same items. A cell is million
-items per second, the better of two runs of best-of-3; the row says how many producers and
-consumers ran (`4x4` is four of each), and "× faster" is `Queue`'s rate over the baseline's, so
-a value below 1 is a loss. The comparator is the queue most code writes, a ~30-line
-`std::mutex` + `std::condition_variable` + `std::deque` (`MutexDeque` in the same file),
-unbounded like the `Queue` it is run against. Both run on the subset they share: a blocking
-channel of ints with no bound, deadline or `pop_back`.
+once (the sum of the ids), so the three queues deliver the same items. A cell is million items
+per second, the better of two runs of best-of-3; the row says how many producers and consumers
+ran (`4x4` is four of each), and "× faster" is `Queue`'s rate over the mutex baseline's, so a
+value below 1 is a loss. The comparators are a ~30-line `std::mutex` +
+`std::condition_variable` + `std::deque` queue, which is what most code writes (`MutexDeque` in
+the same file), and [cameron314/concurrentqueue](https://github.com/cameron314/concurrentqueue)'s
+`BlockingConcurrentQueue` at commit `1e2def4` (master, 4 commits after v1.0.5), fetched by the
+benchmark target only. All three run unbounded on the subset they share: a blocking channel of
+ints with no deadline, no `pop_back` and no `end()` or `finish()`.
 
 Apple M4 Pro (macOS 26), Apple clang 17.0.0 with `-O3 -DNDEBUG`:
 
-| Producers x consumers | `queue::Queue<int>` | mutex + condvar + deque | `Queue` × faster |
-|---|---:|---:|---:|
-| 1x1 | 41.4 | 31.6 | 1.31 |
-| 2x2 | 19.8 | 18.9 | 1.05 |
-| 4x4 | 21.1 | 18.4 | 1.15 |
-| 8x8 | 35.1 | 19.8 | 1.77 |
+| Producers x consumers | `queue::Queue<int>` | mutex + condvar + deque | `Queue` × faster | moodycamel `BlockingConcurrentQueue` |
+|---|---:|---:|---:|---:|
+| 1x1 | 53.4 | 22.8 | 2.35 | 10.2 |
+| 2x2 | 20.8 | 20.0 | 1.04 | 6.8 |
+| 4x4 | 22.2 | 17.0 | 1.30 | 4.6 |
+| 8x8 | 37.3 | 18.5 | 2.02 | 3.7 |
 
 Intel Core i9-9980HK (macOS 15, x86-64, 8 cores / 16 threads), Apple clang 17.0.0 with
 `-O3 -DNDEBUG`:
 
-| Producers x consumers | `queue::Queue<int>` | mutex + condvar + deque | `Queue` × faster |
-|---|---:|---:|---:|
-| 1x1 | 9.9 | 8.2 | 1.21 |
-| 2x2 | 6.7 | 5.3 | 1.26 |
-| 4x4 | 5.2 | 3.9 | 1.33 |
-| 8x8 | 4.1 | 3.4 | 1.21 |
+| Producers x consumers | `queue::Queue<int>` | mutex + condvar + deque | `Queue` × faster | moodycamel `BlockingConcurrentQueue` |
+|---|---:|---:|---:|---:|
+| 1x1 | 10.1 | 8.4 | 1.20 | 9.7 |
+| 2x2 | 7.5 | 6.0 | 1.25 | 7.7 |
+| 4x4 | 5.5 | 4.5 | 1.22 | 8.2 |
+| 8x8 | 4.2 | 3.7 | 1.13 | 7.7 |
 
 ```sh
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DQUEUE_BUILD_BENCH=ON
 cmake --build build --target queue_bench && ./build/queue_bench
 ```
 
-`QUEUE_BUILD_BENCH` is off by default; it fetches a third-party queue for the benchmark target
-only. `Queue` is 1.05 to 1.77 times the baseline on arm64 and 1.21 to 1.33 times on x86-64.
+`QUEUE_BUILD_BENCH` is off by default; it fetches the comparator for the benchmark target only.
+On arm64 `Queue` is 1.04 to 2.35 times the baseline and 3.1 to 10 times moodycamel. On x86-64 it
+is 1.13 to 1.25 times the baseline and level with moodycamel at 1x1 and 2x2; at 4x4 and 8x8
+moodycamel is 1.5 and 1.8 times ahead, because its lock-free design scales with the thread count
+and every `Queue` call takes one mutex. The two runs of a row agree within 10%, except the
+8x8 row on the M4 Pro, where `Queue` measured 37.3 and 26.7.
 
 ## 📚 Documentation
 
