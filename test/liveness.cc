@@ -15,9 +15,9 @@
 //   producers: pop_front, pop_back, a pop that leaves the size at or above the threshold, clear(),
 //              QueueSet::clear(), QueueSet::erase(), QueueSet::pop(), a pop that leaves the count
 //              below the hard limit but at the soft limit (every woken producer refuses), a pop on
-//              one Queue and a clear() or destruction of a stopped Queue sharing the state, end(),
-//              finish(), a woken producer whose insert throws, and a timed producer parked beside
-//              an untimed one.
+//              one Queue and a clear(), destruction or move assignment of a stopped or replaced
+//              Queue sharing the state, end(), finish(), a woken producer whose insert throws, and
+//              a timed producer parked beside an untimed one.
 // The limits have no setter (they are fixed when the QueueState is built), and a timed-out
 // waiter changes nothing, so neither is a class of its own.
 //
@@ -480,6 +480,31 @@ static void shared_state_frees_slot(int how) {
 	t.join();
 }
 
+// Move assignment drops the target's items: their slots go back to its old state, whose parked
+// producers must wake (the count used to keep them, so the producers slept with room).
+static void move_assign_frees_slots() {
+	const char* name = "move assignment wakes its old state's producers";
+	begin(name);
+	auto st = std::make_shared<queue::QueueState>(2);
+	Probe<queue::Queue<int>> a(st), c(st);
+	a.push_back(1);
+	a.push_back(2);
+	Threads t;
+	t.spawn([&] { return c.push_back(10); });
+	t.spawn([&] { return c.push_back(11); });
+	if (check(name, wait_until([&] { return c.push_waiters() == 2; }), "producers did not park")) {
+		Probe<queue::Queue<int>> b;
+		b.push_back(7);
+		a = std::move(b);
+		if (check(name, t.finished(2), "a parked producer was not woken") &&
+		    check(name, t.ok == 2 && c.size() == 2 && c.count() == 2, "wrong count")) {
+			pass(name);
+		}
+	}
+	c.finish();
+	t.join();
+}
+
 // stop: 0 end(), 1 finish(). One untimed and one timed producer.
 static void stop_wakes_producers(int stop) {
 	const char* name = stop ? "finish() wakes parked producers" : "end() wakes parked producers";
@@ -726,6 +751,7 @@ int main(int argc, char** argv) {
 		shared_state_frees_slot(0);
 		shared_state_frees_slot(1);
 		shared_state_frees_slot(2);
+		move_assign_frees_slots();
 		stop_wakes_producers(0);
 		stop_wakes_producers(1);
 		throwing_insert_hands_wake_on();

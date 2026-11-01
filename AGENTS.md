@@ -12,7 +12,7 @@ sanitizers), the invariants you must not break, and the traps.
 queue.h                       The library. Queue<T, Container> + QueueSet<Key>, on a shared QueueState. Header-only.
 test/test.cc                  Correctness: single-threaded API coverage. CTest test `queue`.
 test/concurrent.cc            Concurrent stress: N producers x M consumers, exactly-once accounting. CTest test `queue_concurrent`. The binary you run under sanitizers.
-test/differential.cc          The same single-threaded operation sequences against test/queue_frozen.h; every result must match. CTest test `queue_differential`.
+test/differential.cc          The same single-threaded operation sequences against test/queue_frozen.h; every result must match, except the one listed class (move assignment's count). CTest test `queue_differential`.
 test/liveness.cc              One deterministic case per state change that can release a parked waiter, under a deadline and a watchdog, plus random stress rounds. CTest tests `queue_liveness`, `queue_liveness_stress`.
 test/queue_frozen.h           Frozen copy of queue.h before the inline fast path (1787904). The oracle for differential.cc: never edit it.
 benchmark/bench.cc            Throughput: queue vs mutex+condvar baseline vs moodycamel, single-ended MPMC path.

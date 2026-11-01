@@ -4,6 +4,21 @@ All notable changes to `queue`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the library has no
 releases, so entries are dated.
 
+## 2026-11-01
+
+### Fixed
+
+- Move assignment dropped the target's items without taking them out of its state's count,
+  so that state kept their slots for good and its other `Queue`s' producers could sleep
+  with room. It gives them back and wakes those producers, as the destructor does. It also
+  destroyed the target's old state while holding that state's mutex and then unlocked it,
+  and on self-assignment or between two `Queue`s on one state it passed one mutex to
+  `std::lock` twice: undefined behavior both, which glibc runs without an ASan or TSan
+  report. It keeps the old state alive until the unlock and takes one lock for one state.
+  `test/differential.cc` lists move assignment as the one class whose results differ from
+  the frozen copy (`count()` on the old state read high by the target's size there);
+  `test/test.cc` and a `test/liveness.cc` case cover the rest.
+
 ## 2026-10-31
 
 ### Fixed

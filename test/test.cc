@@ -12,6 +12,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <thread>
 
@@ -304,6 +305,46 @@ static void test_end_wakes_empty_waiter() {
 	std::printf("queue OK: end() wakes a pop parked on an empty queue\n");
 }
 
+// Move assignment: the target's items leave its state's count, as in the destructor; the
+// source's items move over with their count; the old state stays valid until the assignment has
+// released its lock (it used to unlock a destroyed mutex when the target owned its state alone).
+static void test_move_assign() {
+	int v = 0;
+	{
+		auto st = std::make_shared<queue::QueueState>();
+		queue::Queue<int> a(st), c(st);  // c stays on a's old state
+		assert(a.push_back(1) && a.push_back(2) && c.push_back(3));
+		assert(c.count() == 3);
+		queue::Queue<int> b;
+		assert(b.push_back(7));
+		a = std::move(b);
+		assert(c.count() == 1 && c.size() == 1);  // a's two items left st
+		assert(a.size() == 1 && a.count() == 1);
+		assert(a.pop_front(v) && v == 7 && a.count() == 0);
+		assert(c.pop_front(v) && v == 3 && c.count() == 0);
+	}
+	{
+		queue::Queue<int> a, b;  // a's state dies in the assignment
+		assert(a.push_back(1) && b.push_back(2) && b.push_back(3));
+		a = std::move(b);
+		assert(a.size() == 2 && a.count() == 2);
+		assert(a.pop_front(v) && v == 2);
+		assert(a.push_back(4) && a.count() == 2);
+	}
+	{
+		auto st = std::make_shared<queue::QueueState>(3);
+		queue::Queue<int> a(st), b(st);  // one state: one lock
+		assert(a.push_back(1) && a.push_back(2) && b.push_back(3));
+		a = std::move(b);
+		assert(a.size() == 1 && a.count() == 1);
+		assert(a.push_back(4, 0.0) && a.push_back(5, 0.0) && !a.push_back(6, 0.0));  // two slots freed
+		queue::Queue<int>& self = a;
+		a = std::move(self);  // self-assignment changes nothing
+		assert(a.size() == 3 && a.count() == 3);
+	}
+	std::printf("queue OK: move assignment gives the target's slots back and keeps the source's\n");
+}
+
 int main() {
 	test_both_ends_ordering();
 	test_push_pop_aliases();
@@ -317,6 +358,7 @@ int main() {
 	test_finish_wakes_and_rejects();
 	test_end_drains_then_rejects();
 	test_end_wakes_empty_waiter();
+	test_move_assign();
 	std::printf("all queue tests passed\n");
 	return 0;
 }

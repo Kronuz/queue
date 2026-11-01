@@ -190,6 +190,7 @@ Every change, the waiters it can release, and what it wakes:
 | `clear()`, `QueueSet::clear()` (n slots) | producers of any `Queue` on the state | all for n > 1, one for n = 1, if any is parked and there is room; also when this `Queue` is stopping |
 | `end()`, `finish()` | this `Queue`'s consumers and producers | all, on this `Queue`'s `_pop_cond` and on `_push_cond`, after the empty critical section |
 | the destructor (its items leave `_cnt`) | its own waiters, and producers of other `Queue`s | all, on both |
+| move assignment (the target's items leave its old state's `_cnt`) | producers on that state | as `clear()` |
 | a timed waiter's deadline | nobody: no state changes | nothing |
 | a woken waiter that does not use the wake-up | the next parked waiter | one, handed on (below) |
 
@@ -231,10 +232,14 @@ asleep at a deadline.
 
 ## Move, copy, lifetime
 
-Copy is deleted. Move is supported and locks correctly: the move
-constructor locks the source's mutex; move assignment locks both
-mutexes with `std::lock` to avoid a deadlock. A moved-from queue
-keeps its `_ending`/`_finished` reset to false.
+Copy is deleted. The move constructor locks the source's mutex and takes its
+items and state. Move assignment first gives the target's own items back, as the
+destructor does: they leave its state's `_cnt`, and `_room_freed()` wakes that
+state's producers. It locks both mutexes with `std::lock`, or one when both
+`Queue`s share a state, does nothing on self-assignment, and holds the old state
+in a local `shared_ptr` until the lock is released, so the old mutex outlives the
+unlock. The target's `_ending` and `_finished` are reset to false. Neither move
+may run while a thread waits on either `Queue`.
 
 `QueueSet<Key>` extends `Queue<Key, std::list<Key>>` with a
 `std::unordered_map` from key to list iterator, giving a queue of unique values.

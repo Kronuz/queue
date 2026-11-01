@@ -313,15 +313,45 @@ namespace queue {
 			_state = std::move(q._state);
 		}
 
-		// Move assigment
+		// Move assigment. The items this Queue held leave its state's count, as in the destructor,
+		// and the slots they free wake that state's producers. `old` keeps the state (and its
+		// mutex) alive until the lock is released; one lock serves when both share a state.
 		Queue& operator=(Queue&& q) {
-			std::lock(_state->_mutex, q._state->_mutex);
-			std::lock_guard<std::mutex> self_lock(_state->_mutex, std::adopt_lock);
-			std::lock_guard<std::mutex> other_lock(q._state->_mutex, std::adopt_lock);
+			if (this == &q) {
+				return *this;
+			}
+			std::shared_ptr<QueueState> old = _state;
+			std::unique_lock<std::mutex> self_lock;
+			std::unique_lock<std::mutex> other_lock;
+			if (old && q._state && old != q._state) {
+				std::lock(old->_mutex, q._state->_mutex);
+				self_lock = std::unique_lock<std::mutex>(old->_mutex, std::adopt_lock);
+				other_lock = std::unique_lock<std::mutex>(q._state->_mutex, std::adopt_lock);
+			} else if (old) {
+				self_lock = std::unique_lock<std::mutex>(old->_mutex);
+			} else if (q._state) {
+				other_lock = std::unique_lock<std::mutex>(q._state->_mutex);
+			}
+			auto wake = QueueState::_wake::none;
+			if (old) {
+				auto size = _items_queue.size();
+				assert(old->_cnt >= size);
+				old->_cnt_sub(size);
+				wake = old->_room_freed(size);
+			}
 			_items_queue = std::move(q._items_queue);
 			_ending = false;
 			_finished = false;
 			_state = std::move(q._state);
+			if (self_lock) {
+				self_lock.unlock();
+			}
+			if (other_lock) {
+				other_lock.unlock();
+			}
+			if (old) {
+				old->_wake_pushers(wake);
+			}
 			return *this;
 		}
 

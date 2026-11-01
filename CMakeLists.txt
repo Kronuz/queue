@@ -19,6 +19,8 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   add_executable(queue_test test/test.cc)
   target_link_libraries(queue_test PRIVATE queue)
   add_test(NAME queue COMMAND queue_test)
+  # A lock-order regression in move assignment can deadlock: fail it instead of waiting out CTest.
+  set_tests_properties(queue PROPERTIES TIMEOUT 120)
 
   # (b) Concurrent stress: N producers x M consumers, exactly-once accounting.
   add_executable(queue_concurrent test/concurrent.cc)
