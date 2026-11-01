@@ -156,7 +156,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="queue-mutants-") as tmp:
         def fresh(name):
             work = os.path.join(tmp, name)
-            shutil.copytree(ROOT, work, ignore=shutil.ignore_patterns(".git", "build*", "*.o", "third_party"))
+            shutil.copytree(ROOT, work, ignore=shutil.ignore_patterns(".git", "build*", "*.o"))
             return work
 
         failed, err = trial(args.cxx, fresh("clean"), True)
