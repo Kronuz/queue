@@ -12,19 +12,21 @@
 //   consumers: push_back, push_front, a forced push, QueueSet::push, a push on one of two Queues
 //              sharing a QueueState, end(), finish(), a woken consumer whose take throws, and a
 //              timed consumer parked beside an untimed one.
-//   producers: pop_front, pop_back, a pop that leaves the size at or above the threshold, clear(),
-//              QueueSet::clear(), QueueSet::erase(), QueueSet::pop(), a pop that leaves the count
-//              below the hard limit but at the soft limit (every woken producer refuses), a pop on
-//              one Queue and a clear(), destruction or move assignment of a stopped or replaced
-//              Queue sharing the state, end(), finish(), a woken producer whose insert throws, and
-//              a timed producer parked beside an untimed one.
+//   producers: pop_front, pop_back, a pop with a deadline and a non-blocking pop, a pop that leaves
+//              the size at or above the threshold, clear(), clear() of one slot with two producers
+//              parked, QueueSet::clear(), QueueSet::erase(), QueueSet::pop(), a pop that leaves the
+//              count below the hard limit but at the soft limit (every woken producer refuses), a
+//              pop on one Queue and a clear(), destruction of a running, ended or finished Queue
+//              sharing the state, move assignment over a Queue holding items, end(), finish(), a
+//              woken producer whose insert throws, and a timed producer parked beside an untimed one.
 // The limits have no setter (they are fixed when the QueueState is built), and a timed-out
 // waiter changes nothing, so neither is a class of its own.
 //
 // `queue_liveness` runs every case; `queue_liveness stress N` runs N rounds of random producers,
 // consumers and clears on one Queue or two sharing a state, and checks at quiescence that no item
 // is left behind with its consumers asleep (the binary to run under TSan).
-// LIVENESS_DEADLINE_MS overrides the 10 s deadline (a correct wake-up takes microseconds).
+// LIVENESS_DEADLINE_MS overrides the 10 s deadline (a correct wake-up takes microseconds), and
+// LIVENESS_WATCHDOG_MS the 60 s a run may go without finishing a case or a round.
 //
 // Build: c++ -std=c++20 -O1 -pthread -I.. test/liveness.cc
 
@@ -46,6 +48,7 @@
 using namespace std::chrono;
 
 static milliseconds deadline{10000};
+static milliseconds watchdog_floor{60000};
 static std::atomic<long> progress{0};
 static std::atomic<const char*> current{"start"};
 
@@ -348,6 +351,26 @@ static void pop_wakes_producers(int how) {
 	t.join();
 }
 
+// how: 0 pop_back with a deadline, 1 pop_front without waiting (timeout 0). A pop wakes a parked
+// producer whatever its own wait was.
+static void pop_with_timeout_wakes_producer(int how) {
+	const char* name = how ? "a non-blocking pop wakes a parked producer" : "a pop with a deadline wakes a parked producer";
+	begin(name);
+	Probe<queue::Queue<int>> q(1);
+	q.push_back(1);
+	Threads t;
+	t.spawn([&] { return q.push_back(2); });
+	if (check(name, wait_until([&] { return q.push_waiters() == 1; }), "producer did not park")) {
+		int v = 0;
+		if (check(name, how ? q.pop_front(v, 0.0) : q.pop_back(v, 5.0), "pop failed") &&
+		    check(name, t.finished(1), "the parked producer was not woken") && check(name, t.ok == 1 && q.count() == 1, "wrong count")) {
+			pass(name);
+		}
+	}
+	q.finish();
+	t.join();
+}
+
 // CA1: a pop that leaves the size at or above the threshold notified nobody, and a producer
 // parked at the hard limit slept on with room.
 static void pop_above_threshold_wakes_producers() {
@@ -439,12 +462,44 @@ static void soft_limit_refusals_all_leave() {
 	t.join();
 }
 
+// clear() frees one slot of two with two producers parked on the shared state: one goes, the
+// other stays parked (the state is full again), and a later pop releases it.
+static void clear_of_one_slot_wakes_one_producer() {
+	const char* name = "clear() of one slot wakes one of two parked producers";
+	begin(name);
+	auto st = std::make_shared<queue::QueueState>(2);
+	Probe<queue::Queue<int>> a(st), b(st);
+	a.push_back(1);
+	b.push_back(2);
+	Threads t;
+	t.spawn([&] { return b.push_back(3); });
+	t.spawn([&] { return b.push_back(4); });
+	if (check(name, wait_until([&] { return b.push_waiters() == 2; }), "producers did not park")) {
+		a.clear();
+		if (check(name, t.finished(1), "no parked producer was woken")) {
+			// The woken producer has taken the slot; the other has no room and must be parked again.
+			bool parked = check(name, wait_until([&] { return b.push_waiters() == 1; }), "the second producer did not park again");
+			check(name, parked && t.done == 1 && b.count() == 2, "a producer went past the limit");
+			int v = 0;
+			if (check(name, b.pop_front(v), "pop failed") && check(name, t.finished(2), "the later pop did not release the other producer") &&
+			    check(name, t.ok == 2 && b.count() == 2, "wrong count")) {
+				pass(name);
+			}
+		}
+	}
+	a.finish();
+	b.finish();
+	t.join();
+}
+
 // how: 0 a pop on A, 1 clear() on an ended A (CA1 class: clear skipped the wake-up when its own
-// Queue was stopping), 2 destroying a finished A (the destructor skipped it for a finished Queue).
+// Queue was stopping), 2 destroying a finished A (the destructor skipped it for a finished Queue),
+// 3 destroying a running A.
 static void shared_state_frees_slot(int how) {
 	static const char* names[] = {"a pop on A wakes B's producer on a shared state",
 	                              "clear() on an ended A wakes B's producer",
-	                              "destroying a finished A wakes B's producer"};
+	                              "destroying a finished A wakes B's producer",
+	                              "destroying a running A wakes B's producer"};
 	const char* name = names[how];
 	begin(name);
 	auto st = std::make_shared<queue::QueueState>(1);
@@ -701,11 +756,14 @@ int main(int argc, char** argv) {
 	if (const char* ms = std::getenv("LIVENESS_DEADLINE_MS")) {
 		deadline = milliseconds(std::atoi(ms));
 	}
+	if (const char* ms = std::getenv("LIVENESS_WATCHDOG_MS")) {
+		watchdog_floor = milliseconds(std::atoi(ms));
+	}
 	// A case that cannot release its own threads (finish() itself lost) makes no progress.
 	std::atomic<bool> stop{false};
 	std::thread watchdog([&] {
 		long last = -1;
-		auto limit = std::max(deadline * 6, milliseconds(60000));
+		auto limit = std::max(deadline * 6, watchdog_floor);
 		for (;;) {
 			auto end = steady_clock::now() + limit;
 			while (!stop && steady_clock::now() < end) {
@@ -740,8 +798,11 @@ int main(int argc, char** argv) {
 
 		pop_wakes_producers(0);
 		pop_wakes_producers(1);
+		pop_with_timeout_wakes_producer(0);
+		pop_with_timeout_wakes_producer(1);
 		pop_above_threshold_wakes_producers();
 		clear_wakes_producers<queue::Queue<int>>("clear() wakes every parked producer");
+		clear_of_one_slot_wakes_one_producer();
 #ifndef LIVENESS_NO_QUEUESET_CLEAR  // QueueSet::clear did not compile before the fix
 		clear_wakes_producers<queue::QueueSet<int>>("QueueSet::clear() wakes every parked producer");
 #endif
@@ -751,6 +812,7 @@ int main(int argc, char** argv) {
 		shared_state_frees_slot(0);
 		shared_state_frees_slot(1);
 		shared_state_frees_slot(2);
+		shared_state_frees_slot(3);
 		move_assign_frees_slots();
 		stop_wakes_producers(0);
 		stop_wakes_producers(1);

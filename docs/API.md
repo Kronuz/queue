@@ -30,3 +30,7 @@ of limits; each keeps its own items and its own `end()` and `finish()`. There is
 also a `QueueSet<Key>` in the header: a `Queue` with unique values backed by a
 `std::list` plus a hash map, with duplicate-handling policies
 (`update` / `leave` / `renew`). It rides on the same `QueueState` machinery.
+
+A `Queue` is destroyed only after the threads blocked in its calls have returned: `finish()` it and join
+them first. Destroying it wakes the producers of other `Queue`s on its state, not its own callers. Copying is
+deleted; a moved-from `Queue` can be destroyed or assigned to and nothing else.

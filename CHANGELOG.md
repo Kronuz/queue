@@ -6,6 +6,33 @@ releases, so entries are dated.
 
 ## 2026-11-01
 
+### Added
+
+- Four `test/liveness.cc` cases for wake-ups the existing ones did not reach (30 cases
+  now): a pop with a deadline and a non-blocking pop each wake a parked producer; destroying
+  a running `Queue` wakes the producers of another `Queue` on its state; `clear()` of one slot
+  with two producers parked wakes one and leaves the other parked until the next pop.
+- `test/race.cc` (CTest `queue_race`): `end()` and `finish()` run between a waiter's last look
+  at its predicate and its block, for a consumer and a producer. `QUEUE_TEST_HOOK(point)`,
+  empty unless a test defines it, marks the spot, and the untimed waits are written as
+  `while (!pred()) { hook; wait(lk); }`, which is what `wait(lk, pred)` does. Taking the mutex
+  in `_wake_all` is what keeps the broadcast out of that window; removing it was caught only
+  by a race in `test/concurrent.cc` that a run on a quiet machine can miss.
+- `tools/mutants.py`: 24 edits of `queue.h` (a dropped or misplaced notify, an uncounted wait,
+  a wake not handed on, a count not given back, a shared consumer condition variable), each of
+  which a test must fail on. It replaces the hand-copied mutant headers of the review. Each
+  new case has a mutant that fails it. `LIVENESS_WATCHDOG_MS` shortens the 60 s a
+  `test/liveness.cc` run may go without finishing a case, for the mutation run.
+- `QUEUE_BUILD_BENCH` (off by default). `benchmark/bench.cc` fetches
+  cameron314/concurrentqueue at commit `1e2def4` for the bench target alone; the copy under
+  `third_party/` is removed.
+
+### Documented
+
+- A `Queue` is destroyed after the threads blocked in its calls have returned: the destructor
+  wakes the producers of other `Queue`s on its state, not its own callers. A moved-from `Queue`
+  can be destroyed or assigned to and nothing else.
+
 ### Fixed
 
 - Move assignment dropped the target's items without taking them out of its state's count,

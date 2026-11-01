@@ -46,6 +46,14 @@
 #define QUEUE_HOT inline
 #endif
 
+// A test seam, empty unless defined before this header. QUEUE_TEST_HOOK(point) runs with the mutex
+// held in an untimed wait, after the last look at the predicate and before the thread blocks;
+// the points are pop_blocking and push_blocking. test/race.cc uses it to run end() or finish() in
+// that window, which no schedule reaches reliably.
+#ifndef QUEUE_TEST_HOOK
+#define QUEUE_TEST_HOOK(point)
+#endif
+
 namespace queue {
 	using namespace std::chrono_literals;
 
@@ -140,7 +148,10 @@ namespace queue {
 					// No deadline, so no clock read. Every change that can satisfy the
 					// predicate wakes a counted waiter (see ARCHITECTURE.md, "Wake-ups").
 					++_state->_push_waiters;
-					_state->_push_cond.wait(lk, push_wait_pred);
+					while (!push_wait_pred()) {
+						QUEUE_TEST_HOOK(push_blocking);
+						_state->_push_cond.wait(lk);
+					}
 					--_state->_push_waiters;
 				}
 			} else {
@@ -178,7 +189,10 @@ namespace queue {
 					// No deadline, so no clock read. Every change that can satisfy the
 					// predicate wakes a counted waiter (see ARCHITECTURE.md, "Wake-ups").
 					++_pop_waiters;
-					_pop_cond.wait(lk, pop_wait_pred);
+					while (!pop_wait_pred()) {
+						QUEUE_TEST_HOOK(pop_blocking);
+						_pop_cond.wait(lk);
+					}
 					--_pop_waiters;
 				}
 			} else {

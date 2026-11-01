@@ -14,9 +14,10 @@ test/test.cc                  Correctness: single-threaded API coverage. CTest t
 test/concurrent.cc            Concurrent stress: N producers x M consumers, exactly-once accounting. CTest test `queue_concurrent`. The binary you run under sanitizers.
 test/differential.cc          The same single-threaded operation sequences against test/queue_frozen.h; every result must match, except the one listed class (move assignment's count). CTest test `queue_differential`.
 test/liveness.cc              One deterministic case per state change that can release a parked waiter, under a deadline and a watchdog, plus random stress rounds. CTest tests `queue_liveness`, `queue_liveness_stress`.
+test/race.cc                  end() and finish() forced into the window between a waiter's last look at its predicate and its block, through QUEUE_TEST_HOOK. CTest test `queue_race`.
 test/queue_frozen.h           Frozen copy of queue.h before the inline fast path (1787904). The oracle for differential.cc: never edit it.
-benchmark/bench.cc            Throughput: queue vs mutex+condvar baseline vs moodycamel, single-ended MPMC path.
-third_party/concurrentqueue/  Vendored cameron314/concurrentqueue (header-only), for the benchmark only.
+tools/mutants.py              Breaks queue.h in 24 ways (a dropped notify, an uncounted wait, a wake not handed on, a count not given back) and requires a test to fail on each.
+benchmark/bench.cc            Throughput: queue vs mutex+condvar baseline vs moodycamel, single-ended MPMC path (QUEUE_BUILD_BENCH=ON; moodycamel is fetched at a pinned commit).
 CMakeLists.txt                INTERFACE library queue + alias queue::queue; test + sanitizer + bench targets, top-level only.
 LICENSE                       MIT, Copyright (c) 2015-2019 Dubalu LLC.
 README.md                     What it is, install, quick start, current benchmark numbers.
@@ -35,19 +36,20 @@ the benchmark.
 cmake -B build && cmake --build build && ctest --test-dir build
 ```
 
-Five CTest tests: `queue` (from `test/test.cc`) prints a line per API area and
+Six CTest tests: `queue` (from `test/test.cc`) prints a line per API area and
 ends with `all queue tests passed`; `queue_concurrent` (from
 `test/concurrent.cc`) prints a per-scenario accounting table and ends with
 `RESULT: OK`; `queue_differential` (from `test/differential.cc`) ends with
 `all queue differential tests passed`; `queue_liveness` and `queue_liveness_stress`
 (from `test/liveness.cc`, the second with `stress 400`) print a line per case and end
-with `RESULT: OK`. Or directly:
+with `RESULT: OK`; `queue_race` (from `test/race.cc`) prints a line per case and ends with `RESULT: OK`. Or directly:
 
 ```sh
 c++ -std=c++20 -I. test/test.cc -o test/test && ./test/test
 c++ -std=c++20 -O2 -I. test/concurrent.cc -o test/concurrent && ./test/concurrent
 c++ -std=c++20 -I. -Itest test/differential.cc -o test/differential && ./test/differential
 c++ -std=c++20 -O1 -I. test/liveness.cc -o test/liveness && ./test/liveness && ./test/liveness stress 400
+c++ -std=c++20 -O1 -I. test/race.cc -o test/race && ./test/race
 ```
 
 A liveness case that fails prints `FAIL <case>` after its deadline (10 s,
@@ -80,22 +82,32 @@ section records the expected result.
 
 ```sh
 CXX=$(brew --prefix llvm)/bin/clang++
-cmake -B build -DCMAKE_CXX_COMPILER=$CXX
+cmake -B build -DCMAKE_CXX_COMPILER=$CXX -DQUEUE_BUILD_BENCH=ON
 cmake --build build --target queue_bench && ./build/queue_bench
-# or: $CXX -std=c++20 -O3 -DNDEBUG -I. -Ithird_party/concurrentqueue benchmark/bench.cc -o bench && ./bench
 ```
 
-It prints a Mitems/sec table (impl x thread shape). Always build it `-O3
--DNDEBUG`; a debug build inverts the conclusions.
+`QUEUE_BUILD_BENCH` is off by default: it fetches cameron314/concurrentqueue at a pinned commit for the bench
+target only. The bench prints a Mitems/sec table (impl x thread shape). It is always built `-O3 -DNDEBUG`; a
+debug build inverts the conclusions.
+
+## Mutation check
+
+```sh
+python3 tools/mutants.py [--jobs N] [--filter SUBSTRING] [--all]
+```
+
+Each mutant edits one spot of `queue.h` in a scratch copy, builds `test/liveness.cc`, `test/test.cc`,
+`test/concurrent.cc` and `test/differential.cc` from it and runs them. It is killed when a test fails, hits its
+watchdog or times out twice. The script exits non-zero when a mutant survives, stops compiling or no longer matches
+its text in `queue.h`. After changing a wake-up, a count or a wait, run it, and add a mutant with each new case.
 
 ## Conventions
 
 - **C++20**, header-only. Keep it that way. Anything that forces a `.cc` for the
   library itself does not belong here.
 - **No external dependencies in `queue.h`.** Its includes are pure `std`. Do not
-  add a third-party or Xapiand header. (`third_party/concurrentqueue` exists only
-  to give the benchmark something to compare against; the library never includes
-  it.)
+  add a third-party or Xapiand header. (The benchmark fetches
+  cameron314/concurrentqueue to compare against; the library never includes it.)
 - **Xapiand consumes this repository.** Xapiand fetches this library at `main`,
   so a change here ships to Xapiand. Record behavior changes in CHANGELOG.md.
 - Double quotes in code; no em dashes in prose.
@@ -138,6 +150,11 @@ produce a lost wakeup, a deadlock, or a torn read rather than a compile error.
   notifies the next producer when a thread that blocked refuses (soft limit,
   shutdown), and the `_hand_on` guard in the `_impl` bodies does it when the
   insert or take after a wait throws. `notify_one` is only enough because of this.
+- **`QUEUE_TEST_HOOK` is a test seam, empty by default.** The untimed waits are
+  written as `while (!pred()) { QUEUE_TEST_HOOK(point); cv.wait(lk); }`, the same as
+  `cv.wait(lk, pred)`, so `test/race.cc` can run `end()` or `finish()` after the last
+  look at the predicate and before the block. Keep the hook between the two, with the
+  mutex held.
 - **Shutdown locks before it broadcasts.** `_wake_all()` takes and releases the
   mutex before notifying. Untimed waits have no periodic re-check, so dropping
   that empty critical section can lose the shutdown wake-up.

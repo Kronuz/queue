@@ -49,6 +49,14 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   add_test(NAME queue_liveness COMMAND queue_liveness)
   add_test(NAME queue_liveness_stress COMMAND queue_liveness stress 400)
 
+  # (f) Race: end() or finish() landing between a waiter's last look at its predicate and its
+  # block, forced through QUEUE_TEST_HOOK. Without the empty critical section in `_wake_all` the
+  # waiter sleeps through it.
+  add_executable(queue_race test/race.cc)
+  target_link_libraries(queue_race PRIVATE queue)
+  add_test(NAME queue_race COMMAND queue_race)
+  set_tests_properties(queue_race PROPERTIES TIMEOUT 60)
+
   # Sanitizer builds of the concurrent stress test. These are separate targets
   # (not run by ctest by default) because they want the Homebrew LLVM toolchain
   # and a scaled item count. Build with:

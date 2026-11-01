@@ -166,11 +166,15 @@ Both call `_wake_all()`, which locks and unlocks the mutex and then broadcasts o
 the `Queue`'s `_pop_cond` and on the shared `_push_cond`. A waiter holds the mutex
 from its predicate check until it is inside `wait()`, so the empty critical
 section orders the flag store before that waiter blocks and the broadcast cannot
-be lost. Every parked thread of that `Queue` wakes, re-checks its predicate, and
+be lost. `test/race.cc` forces a stop into that window through `QUEUE_TEST_HOOK`, which
+marks it in the untimed waits and is empty unless a test defines it. Every parked thread
+of that `Queue` wakes, re-checks its predicate, and
 returns false; producers of other `Queue`s on the state re-check and sleep again.
 The destructor takes the mutex, subtracts the remaining items from `_cnt`, marks
-the queue finished and broadcasts on both, so tearing down a queue releases any
-thread still blocked on it and gives its slots to producers of other `Queue`s.
+the queue finished and broadcasts on both, which gives its slots to producers of
+other `Queue`s on the state. It does not release threads blocked in calls on the
+destroyed `Queue` itself: they would return into an object that no longer exists.
+`finish()` the `Queue` and join those threads before destroying it.
 
 ## Wake-ups
 
@@ -239,7 +243,8 @@ state's producers. It locks both mutexes with `std::lock`, or one when both
 `Queue`s share a state, does nothing on self-assignment, and holds the old state
 in a local `shared_ptr` until the lock is released, so the old mutex outlives the
 unlock. The target's `_ending` and `_finished` are reset to false. Neither move
-may run while a thread waits on either `Queue`.
+may run while a thread waits on either `Queue`. A moved-from `Queue` has no state: it
+can be destroyed or assigned to, and nothing else (including being moved from again).
 
 `QueueSet<Key>` extends `Queue<Key, std::list<Key>>` with a
 `std::unordered_map` from key to list iterator, giving a queue of unique values.
