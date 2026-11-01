@@ -19,12 +19,13 @@ hand-off channels between threads that need back-pressure and a clean shutdown.
   or a priority lane at the front.
 - **Timeouts on every call.** A negative timeout blocks, `0` never blocks, and a
   positive one waits that many seconds.
-- **Back-pressure.** A hard limit blocks producers when full; a soft limit and a
-  wake threshold keep a near-full queue from thrashing.
+- **Back-pressure.** A hard limit blocks producers when full; a soft limit below
+  it turns pushes away instead of blocking them.
 - **Two-stage shutdown.** `end()` stops pushes and lets consumers drain;
   `finish()` wakes everyone and stops.
 - **`QueueSet`**: the same queue with unique values and a duplicate policy.
-- **Checked clean** under ASan and TSan with exactly-once accounting.
+- **Checked clean** under ASan and TSan with exactly-once accounting, and a
+  liveness test for every change that can wake a waiting thread.
 
 ## 📦 Installation
 
@@ -116,8 +117,10 @@ cmake --build build --target queue_bench && ./build/queue_bench
 cmake -B build && cmake --build build && ctest --test-dir build
 ```
 
-CTest runs the API tests, a many-producer, many-consumer stress test, and the
-work-queue example.
+CTest runs the API tests, a many-producer, many-consumer stress test, a
+differential test against a frozen copy of the header, the liveness tests (a
+lost wake-up fails them within seconds instead of hanging), and the work-queue
+example.
 
 ## 🤝 Contributing
 

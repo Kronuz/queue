@@ -13,6 +13,7 @@ queue.h                       The library. Queue<T, Container> + QueueSet<Key>, 
 test/test.cc                  Correctness: single-threaded API coverage. CTest test `queue`.
 test/concurrent.cc            Concurrent stress: N producers x M consumers, exactly-once accounting. CTest test `queue_concurrent`. The binary you run under sanitizers.
 test/differential.cc          The same single-threaded operation sequences against test/queue_frozen.h; every result must match. CTest test `queue_differential`.
+test/liveness.cc              One deterministic case per state change that can release a parked waiter, under a deadline and a watchdog, plus random stress rounds. CTest tests `queue_liveness`, `queue_liveness_stress`.
 test/queue_frozen.h           Frozen copy of queue.h before the inline fast path (1787904). The oracle for differential.cc: never edit it.
 benchmark/bench.cc            Throughput: queue vs mutex+condvar baseline vs moodycamel, single-ended MPMC path.
 third_party/concurrentqueue/  Vendored cameron314/concurrentqueue (header-only), for the benchmark only.
@@ -34,17 +35,23 @@ the benchmark.
 cmake -B build && cmake --build build && ctest --test-dir build
 ```
 
-Three CTest tests: `queue` (from `test/test.cc`) prints a line per API area and
+Five CTest tests: `queue` (from `test/test.cc`) prints a line per API area and
 ends with `all queue tests passed`; `queue_concurrent` (from
 `test/concurrent.cc`) prints a per-scenario accounting table and ends with
 `RESULT: OK`; `queue_differential` (from `test/differential.cc`) ends with
-`all queue differential tests passed`. Or directly:
+`all queue differential tests passed`; `queue_liveness` and `queue_liveness_stress`
+(from `test/liveness.cc`, the second with `stress 400`) print a line per case and end
+with `RESULT: OK`. Or directly:
 
 ```sh
 c++ -std=c++20 -I. test/test.cc -o test/test && ./test/test
 c++ -std=c++20 -O2 -I. test/concurrent.cc -o test/concurrent && ./test/concurrent
 c++ -std=c++20 -I. -Itest test/differential.cc -o test/differential && ./test/differential
+c++ -std=c++20 -O1 -I. test/liveness.cc -o test/liveness && ./test/liveness && ./test/liveness stress 400
 ```
+
+A liveness case that fails prints `FAIL <case>` after its deadline (10 s,
+`LIVENESS_DEADLINE_MS` to change it) and goes on to the next case.
 
 `test/concurrent.cc` takes an optional item count (default 1,000,000); pass a
 smaller number to run it faster under a sanitizer. g++ 11's ASan on the Linux VM
@@ -61,6 +68,7 @@ these, or do it by hand:
 CXX=$(brew --prefix llvm)/bin/clang++
 $CXX -std=c++20 -fsanitize=address -g -O1 -I. test/concurrent.cc -o /tmp/asan && /tmp/asan
 $CXX -std=c++20 -fsanitize=thread  -g -O1 -I. test/concurrent.cc -o /tmp/tsan && /tmp/tsan 200000
+$CXX -std=c++20 -fsanitize=thread  -g -O1 -I. test/liveness.cc -o /tmp/tsan_live && /tmp/tsan_live && /tmp/tsan_live stress 1000
 ```
 
 Both are expected to be **clean** (no leaks, no races, exit 0) with exact
@@ -114,17 +122,31 @@ produce a lost wakeup, a deadlock, or a torn read rather than a compile error.
   that asymmetry: it is what lets `end()` mean "drain" and `finish()` mean "stop
   now."
 - **Count every blocked waiter.** Each blocking branch increments
-  `_pop_waiters`/`_push_waiters` before the wait and decrements it after, under
-  the mutex. A notifier skips the condition variable when the count is zero, so
-  an uncounted waiter misses its wake-up and an untimed one hangs.
-  `test/concurrent.cc`'s all-untimed scenario catches this.
+  `_pop_waiters` (the `Queue`'s) or `_push_waiters` (the state's) before the wait
+  and decrements it after, under the mutex. A notifier skips the condition
+  variable when the count is zero, so an uncounted waiter misses its wake-up and
+  an untimed one hangs. `test/concurrent.cc`'s all-untimed scenario catches this.
+- **Every state change that can release a waiter wakes one that acts on it.**
+  ARCHITECTURE.md's "Wake-ups" lists them, and `test/liveness.cc` has a case for
+  each. A new operation that removes items asks `_room_freed()` how many
+  producers to wake, whatever its own `Queue`'s flags: producers of other
+  `Queue`s on the state can use the room.
+- **Consumers wait per `Queue`.** `_pop_cond` and `_pop_waiters` live in the
+  `Queue` because the pop predicate reads only its own items and flags. On the
+  shared state a push could wake another `Queue`'s consumer, which sleeps again.
+- **A woken thread that does not use its wake-up hands it on.** `_push_wait`
+  notifies the next producer when a thread that blocked refuses (soft limit,
+  shutdown), and the `_hand_on` guard in the `_impl` bodies does it when the
+  insert or take after a wait throws. `notify_one` is only enough because of this.
 - **Shutdown locks before it broadcasts.** `_wake_all()` takes and releases the
   mutex before notifying. Untimed waits have no periodic re-check, so dropping
   that empty critical section can lose the shutdown wake-up.
 - **Keep the fast path inline.** `_push_room()` must stay exactly the case where
-  `_push_wait` returns true without waiting, and the four hot operations stay
-  `QUEUE_HOT`. Moving the common case back behind the out-of-line `_push_wait` halves
-  contended throughput on x86 with Apple clang (0.55x of a plain mutex queue at 8x8).
+  `_push_wait` returns true without waiting, and the four hot operations and their
+  `_impl` bodies stay `QUEUE_HOT`. Moving the common case back behind the out-of-line
+  `_push_wait` halves contended throughput on x86 with Apple clang (0.55x of a plain
+  mutex queue at 8x8); moving the waits into separate out-of-line functions cost 15-20%
+  at 4x4 and 8x8.
   Time any change to these paths interleaved against a mutex+condvar+deque baseline,
   twice, with an A/A column; a single best-of-N run on a shared host flipped the verdict
   on this queue.
@@ -135,9 +157,10 @@ produce a lost wakeup, a deadlock, or a torn read rather than a compile error.
   `clear` subtracts. `count()`, the bound check, and the destructor's
   `_cnt -= size` all rely on it staying in step with the container. An asymmetric
   edit desyncs the bound silently.
-- **Only a successful op notifies.** A failed push or pop changes no state, so no
-  waiter can make progress, and shutdown wake-ups come from `end()`/`finish()`.
-  Do not add a failure-path notify.
+- **Only a successful op notifies, plus the hand-on.** A failed push or pop
+  changes no state, so no waiter can make progress, and shutdown wake-ups come
+  from `end()`/`finish()`. The one failure-path notify is the hand-on of a
+  wake-up a blocked thread took and did not use.
 - **`force` bypasses the bound.** `push_*(..., force=true)` skips the wait and
   the capacity check entirely, so it can push past `_hard_limit`. That is by
   design; just know it sidesteps back-pressure.

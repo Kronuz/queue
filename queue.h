@@ -34,9 +34,10 @@
 #include <mutex>
 #include <unordered_map>
 
-// The four hot operations (push_back, push_front, pop_back, pop_front) are small once the common
-// case is decided inline, and they run inside a producer/consumer loop: as an out-of-line call
-// they cost 2x throughput under contention on x86. Force them into the caller.
+// The four hot operations (push_back, push_front, pop_back, pop_front) and their _impl bodies are
+// small once the common case is decided inline, and they run inside a producer/consumer loop: as
+// an out-of-line call they cost 2x throughput under contention on x86 (the unique_lock then lives
+// in memory). Force them into the caller.
 #if defined(__GNUC__) || defined(__clang__)
 #define QUEUE_HOT __attribute__((always_inline)) inline
 #elif defined(_MSC_VER)
@@ -56,15 +57,14 @@ namespace queue {
 		// A mutex object to control access to the underlying queue object
 		mutable std::mutex _mutex;
 
-		// A variable condition to make threads wait on specified condition values
-		std::condition_variable _pop_cond;
+		// Producers wait here for room. The room (_cnt against the limits) is shared by every
+		// Queue on this state, so every producer waits for the same thing and any of them can
+		// take a freed slot. Consumers wait on their own Queue's _pop_cond.
 		std::condition_variable _push_cond;
 		std::atomic_size_t _cnt;
 
-		// Threads blocked in a pop / push wait. Only touched with _mutex held, so
-		// a notifier can skip the condvar call (a futex-class operation) when
-		// nobody is waiting.
-		size_t _pop_waiters = 0;
+		// Threads blocked in a push wait. Only touched with _mutex held, so a notifier can skip
+		// the condvar call (a futex-class operation) when nobody is waiting.
 		size_t _push_waiters = 0;
 
 		// _cnt is only modified with _mutex held; the atomic exists for the
@@ -73,6 +73,26 @@ namespace queue {
 		// full barrier inside the critical section (a plain store is a mov).
 		void _cnt_add(size_t n) noexcept { _cnt.store(_cnt.load(std::memory_order_relaxed) + n, std::memory_order_release); }
 		void _cnt_sub(size_t n) noexcept { _cnt.store(_cnt.load(std::memory_order_relaxed) - n, std::memory_order_release); }
+
+		// Which parked producers to wake after _cnt dropped by `freed`, decided under _mutex:
+		// none without a waiter or without room below the hard limit, one for one freed slot,
+		// all for more. A woken producer that does not take the slot hands the wake-up on.
+		enum class _wake : unsigned char { none, one, all };
+
+		_wake _room_freed(size_t freed) const noexcept {
+			if (!_push_waiters || !freed || _cnt.load(std::memory_order_relaxed) >= _hard_limit) {
+				return _wake::none;
+			}
+			return freed == 1 ? _wake::one : _wake::all;
+		}
+
+		void _wake_pushers(_wake wake) noexcept {
+			if (wake == _wake::one) {
+				_push_cond.notify_one();
+			} else if (wake == _wake::all) {
+				_push_cond.notify_all();
+			}
+		}
 
 		QueueState(size_t hard_limit=-1, size_t soft_limit=-1, size_t threshold=-1)
 			: _hard_limit(hard_limit),
@@ -89,15 +109,25 @@ namespace queue {
 		std::atomic_bool _ending;
 		std::atomic_bool _finished;
 
+		// Consumers of this Queue wait here, guarded by _state->_mutex. The pop predicate reads
+		// only this Queue's items and flags, so with a shared QueueState a push must wake a
+		// consumer of this Queue, not one of another Queue that would go back to sleep.
+		std::condition_variable _pop_cond;
+		size_t _pop_waiters = 0;
+
 		std::shared_ptr<QueueState> _state;
 
-		bool _push_wait(double timeout, std::unique_lock<std::mutex>& lk) {
+		// Sets `waited` when the thread blocked: it may then hold a notify_one meant for whoever
+		// takes the freed slot. A producer that waited and refuses (its Queue is stopping, or the
+		// count is at the soft limit) leaves that slot free, so it wakes the next one, under the lock.
+		bool _push_wait(double timeout, std::unique_lock<std::mutex>& lk, bool& waited) {
 			auto push_wait_pred = [this]() {
 				return _finished || _ending || _state->_cnt < _state->_hard_limit;
 			};
 			if (push_wait_pred()) {
 				// Already satisfied: no waiting, no clock read.
 			} else if (timeout) {
+				waited = true;
 				if (timeout > 0.0) {
 					auto timeout_tp = std::chrono::steady_clock::now() + std::chrono::duration<double>(timeout);
 					++_state->_push_waiters;
@@ -107,8 +137,8 @@ namespace queue {
 						return false;
 					}
 				} else {
-					// No deadline, so no clock read. end()/finish() take the
-					// mutex before notifying, so no wake-up can be lost.
+					// No deadline, so no clock read. Every change that can satisfy the
+					// predicate wakes a counted waiter (see ARCHITECTURE.md, "Wake-ups").
 					++_state->_push_waiters;
 					_state->_push_cond.wait(lk, push_wait_pred);
 					--_state->_push_waiters;
@@ -117,14 +147,17 @@ namespace queue {
 				return false;
 			}
 
-			if (_finished || _ending) {
-				return false;
+			if (!(_finished || _ending) && _state->_cnt < _state->_soft_limit) {
+				return true;
 			}
-
-			return _state->_cnt < _state->_soft_limit;
+			if (waited) {
+				_state->_wake_pushers(_state->_room_freed(1));
+			}
+			return false;
 		}
 
-		bool _pop_wait(double timeout, std::unique_lock<std::mutex>& lk) {
+		// Sets `waited` like _push_wait.
+		bool _pop_wait(double timeout, std::unique_lock<std::mutex>& lk, bool& waited) {
 			auto pop_wait_pred = [this]() {
 				// While the queue is empty, make the thread that runs this wait
 				return _finished || _ending || !_items_queue.empty();
@@ -132,20 +165,21 @@ namespace queue {
 			if (pop_wait_pred()) {
 				// Already satisfied: no waiting, no clock read.
 			} else if (timeout) {
+				waited = true;
 				if (timeout > 0.0) {
 					auto timeout_tp = std::chrono::steady_clock::now() + std::chrono::duration<double>(timeout);
-					++_state->_pop_waiters;
-					bool ok = _state->_pop_cond.wait_until(lk, timeout_tp, pop_wait_pred);
-					--_state->_pop_waiters;
+					++_pop_waiters;
+					bool ok = _pop_cond.wait_until(lk, timeout_tp, pop_wait_pred);
+					--_pop_waiters;
 					if (!ok) {
 						return false;
 					}
 				} else {
-					// No deadline, so no clock read. end()/finish() take the
-					// mutex before notifying, so no wake-up can be lost.
-					++_state->_pop_waiters;
-					_state->_pop_cond.wait(lk, pop_wait_pred);
-					--_state->_pop_waiters;
+					// No deadline, so no clock read. Every change that can satisfy the
+					// predicate wakes a counted waiter (see ARCHITECTURE.md, "Wake-ups").
+					++_pop_waiters;
+					_pop_cond.wait(lk, pop_wait_pred);
+					--_pop_waiters;
 				}
 			} else {
 				return false;
@@ -165,86 +199,97 @@ namespace queue {
 			return !(_finished || _ending) && _state->_cnt < _state->_hard_limit && _state->_cnt < _state->_soft_limit;
 		}
 
+		// Armed by a thread that waited for the insert or take it is about to make. If that throws,
+		// the slot or item it was woken for is left behind, so it wakes the next waiter, under the
+		// lock. Disarmed when the operation succeeds; with exceptions off it never fires.
+		struct _hand_on {
+			Queue* q;
+			bool push;
+			bool armed;
+			~_hand_on() {
+				if (armed) {
+					if (push) {
+						q->_state->_wake_pushers(q->_state->_room_freed(1));
+					} else if (q->_pop_waiters && !q->_items_queue.empty()) {
+						q->_pop_cond.notify_one();
+					}
+				}
+			}
+		};
+
 		template<typename E>
-		bool _push_front_impl(E&& element, double timeout, std::unique_lock<std::mutex>& lk, bool force = false) {
-			bool ret = force || _push_room() || _push_wait(timeout, lk);
+		QUEUE_HOT bool _push_front_impl(E&& element, double timeout, std::unique_lock<std::mutex>& lk, bool force = false) {
+			bool waited = false;
+			bool ret = force || _push_room() || _push_wait(timeout, lk, waited);
 			if (ret) {
+				_hand_on guard{this, true, waited};
 				// Insert the element in the queue
 				_items_queue.push_front(std::forward<E>(element));
 				_state->_cnt_add(1);
+				guard.armed = false;
 			}
 			return ret;
 		}
 
 		template<typename E>
-		bool _push_back_impl(E&& element, double timeout, std::unique_lock<std::mutex>& lk, bool force = false) {
-			bool ret = force || _push_room() || _push_wait(timeout, lk);
+		QUEUE_HOT bool _push_back_impl(E&& element, double timeout, std::unique_lock<std::mutex>& lk, bool force = false) {
+			bool waited = false;
+			bool ret = force || _push_room() || _push_wait(timeout, lk, waited);
 			if (ret) {
+				_hand_on guard{this, true, waited};
 				// Insert the element in the queue
 				_items_queue.push_back(std::forward<E>(element));
 				_state->_cnt_add(1);
+				guard.armed = false;
 			}
 			return ret;
 		}
 
-		bool _pop_back_impl(T& element, double timeout, std::unique_lock<std::mutex>& lk) {
-			bool ret = _pop_wait(timeout, lk);
+		QUEUE_HOT bool _pop_back_impl(T& element, double timeout, std::unique_lock<std::mutex>& lk) {
+			bool waited = false;
+			bool ret = _pop_wait(timeout, lk, waited);
 			if (ret) {
-				//when the condition variable is unlocked, popped the element
+				_hand_on guard{this, false, waited};
 				element = std::move(_items_queue.back());
-
-				//pop the element
 				_items_queue.pop_back();
 				assert(_state->_cnt > 0);
 				_state->_cnt_sub(1);
+				guard.armed = false;
 			}
 			return ret;
 		}
 
-		bool _pop_front_impl(T& element, double timeout, std::unique_lock<std::mutex>& lk) {
-			bool ret = _pop_wait(timeout, lk);
+		QUEUE_HOT bool _pop_front_impl(T& element, double timeout, std::unique_lock<std::mutex>& lk) {
+			bool waited = false;
+			bool ret = _pop_wait(timeout, lk, waited);
 			if (ret) {
-				//when the condition variable is unlocked, popped the element
+				_hand_on guard{this, false, waited};
 				element = std::move(_items_queue.front());
-
-				//pop the element
 				_items_queue.pop_front();
 				assert(_state->_cnt > 0);
 				_state->_cnt_sub(1);
+				guard.armed = false;
 			}
 			return ret;
 		}
 
-		bool _clear_impl(std::unique_lock<std::mutex>&) noexcept {
+		// Drops every item; returns how many, the slots it freed.
+		size_t _clear_impl(std::unique_lock<std::mutex>&) noexcept {
 			auto size = _items_queue.size();
 			_items_queue.clear();
 			assert(_state->_cnt >= size);
 			_state->_cnt_sub(size);
-
-			if (_finished || _ending) {
-				return false;
-			}
-
-			return true;
+			return size;
 		}
 
-		// Wake every waiter. The empty critical section orders the flag store
-		// before any waiter that has already evaluated its predicate but not yet
-		// blocked: that waiter holds the mutex until it is inside wait(), so
-		// after this lock/unlock pair the notify cannot be lost.
+		// Wake every waiter of this Queue: its consumers, and the producers on the shared
+		// state (its own among them). The empty critical section orders the flag store before
+		// any waiter that has already evaluated its predicate but not yet blocked: that waiter
+		// holds the mutex until it is inside wait(), so after this lock/unlock pair the notify
+		// cannot be lost.
 		void _wake_all() noexcept {
 			{ std::lock_guard<std::mutex> lk(_state->_mutex); }
-			_state->_pop_cond.notify_all();
-			_state->_push_cond.notify_all();
-		}
-
-		// finish() for callers already holding the mutex (the destructor).
-		void _finish_locked() noexcept {
-			if (_finished) {
-				return;
-			}
-			_finished = true;
-			_state->_pop_cond.notify_all();
+			_pop_cond.notify_all();
 			_state->_push_cond.notify_all();
 		}
 
@@ -286,13 +331,17 @@ namespace queue {
 		// Copy assigment
 		Queue& operator=(const Queue& q) = delete;
 
+		// Finishes the queue and gives its items' slots back to the shared state, so producers
+		// of other Queues on it wake too.
 		~Queue() {
 			if (_state) {
 				std::lock_guard<std::mutex> lk(_state->_mutex);
 				auto size = _items_queue.size();
 				assert(_state->_cnt >= size);
 				_state->_cnt_sub(size);
-				_finish_locked();
+				_finished = true;
+				_pop_cond.notify_all();
+				_state->_push_cond.notify_all();
 			}
 		}
 
@@ -316,14 +365,12 @@ namespace queue {
 		QUEUE_HOT bool push_back(E&& element, double timeout = -1.0, bool force = false) {
 			std::unique_lock<std::mutex> lk(_state->_mutex);
 			bool pushed = _push_back_impl(std::forward<E>(element), timeout, lk, force);
-			bool wake = pushed && _state->_pop_waiters;
+			bool wake = pushed && _pop_waiters;
 			lk.unlock();
 
-			// Only a successful op changes state, so only it notifies; shutdown
-			// wake-ups come from end()/finish().
+			// A push adds one item, which one consumer of this Queue can take.
 			if (wake) {
-				// Notifiy waiting thread it can push/pop now
-				_state->_pop_cond.notify_one();
+				_pop_cond.notify_one();
 			}
 
 			return pushed;
@@ -333,12 +380,11 @@ namespace queue {
 		QUEUE_HOT bool push_front(E&& element, double timeout = -1.0, bool force = false) {
 			std::unique_lock<std::mutex> lk(_state->_mutex);
 			bool pushed = _push_front_impl(std::forward<E>(element), timeout, lk, force);
-			bool wake = pushed && _state->_pop_waiters;
+			bool wake = pushed && _pop_waiters;
 			lk.unlock();
 
 			if (wake) {
-				// Notifiy waiting thread it can push/pop now
-				_state->_pop_cond.notify_one();
+				_pop_cond.notify_one();
 			}
 
 			return pushed;
@@ -352,13 +398,11 @@ namespace queue {
 		QUEUE_HOT bool pop_back(T& element, double timeout=-1.0) {
 			std::unique_lock<std::mutex> lk(_state->_mutex);
 			bool popped = _pop_back_impl(element, timeout, lk);
-			bool wake = popped && _state->_push_waiters && _items_queue.size() < _state->_threshold;
+			auto wake = popped ? _state->_room_freed(1) : QueueState::_wake::none;
 			lk.unlock();
 
-			if (wake) {
-				// Notifiy waiting thread it can push/pop now
-				_state->_push_cond.notify_one();
-			}
+			// A pop frees one slot, which one producer on the state can take.
+			_state->_wake_pushers(wake);
 
 			return popped;
 		}
@@ -366,13 +410,10 @@ namespace queue {
 		QUEUE_HOT bool pop_front(T& element, double timeout=-1.0) {
 			std::unique_lock<std::mutex> lk(_state->_mutex);
 			bool popped = _pop_front_impl(element, timeout, lk);
-			bool wake = popped && _state->_push_waiters && _items_queue.size() < _state->_threshold;
+			auto wake = popped ? _state->_room_freed(1) : QueueState::_wake::none;
 			lk.unlock();
 
-			if (wake) {
-				// Notifiy waiting thread it can push/pop now
-				_state->_push_cond.notify_one();
-			}
+			_state->_wake_pushers(wake);
 
 			return popped;
 		}
@@ -381,15 +422,14 @@ namespace queue {
 			return pop_front(element, timeout);
 		}
 
+		// Frees every slot this Queue holds, so it wakes every parked producer on the state,
+		// even when this Queue is ending or finished: producers of other Queues can use them.
 		void clear() {
 			std::unique_lock<std::mutex> lk(_state->_mutex);
-			bool cleared = _clear_impl(lk) && _state->_push_waiters;
+			auto wake = _state->_room_freed(_clear_impl(lk));
 			lk.unlock();
 
-			if (cleared) {
-				// Notifiy waiting thread it can push/pop now
-				_state->_push_cond.notify_one();
-			}
+			_state->_wake_pushers(wake);
 		}
 
 		template <typename F>
@@ -444,8 +484,10 @@ namespace queue {
 	protected:
 		std::unordered_map<Key, typename std::list<Key>::iterator, Hash, KeyEqual> _items_map;
 
+		// `renewed`: the key was erased to be pushed again at the front. If the push fails the
+		// erase freed a slot, which wakes a producer like a pop does.
 		template<typename E>
-		bool _push(E&& element, double timeout, std::unique_lock<std::mutex>& lk) {
+		bool _push(E&& element, double timeout, std::unique_lock<std::mutex>& lk, bool renewed = false) {
 			bool pushed = Queue_t::_push_front_impl(std::forward<E>(element), timeout, lk);
 
 			if (pushed) {
@@ -453,13 +495,14 @@ namespace queue {
 				_items_map[*first] = first;
 			}
 
-			bool wake = pushed && Queue_t::_state->_pop_waiters;
+			bool wake = pushed && Queue_t::_pop_waiters;
+			auto room = (renewed && !pushed) ? Queue_t::_state->_room_freed(1) : QueueState::_wake::none;
 			lk.unlock();
 
 			if (wake) {
-				// Notifiy waiting thread it can push/pop now
-				Queue_t::_state->_pop_cond.notify_one();
+				Queue_t::_pop_cond.notify_one();
 			}
+			Queue_t::_state->_wake_pushers(room);
 
 			return pushed;
 		}
@@ -488,7 +531,7 @@ namespace queue {
 						_items_map.erase(it);
 						assert(Queue_t::_state->_cnt > 0);
 						Queue_t::_state->_cnt_sub(1);
-						break;
+						return _push(std::forward<E>(element), timeout, lk, true);
 				}
 			}
 
@@ -510,6 +553,7 @@ namespace queue {
 				_items_map.erase(it);
 				assert(Queue_t::_state->_cnt > 0);
 				Queue_t::_state->_cnt_sub(1);
+				return _push(std::forward<E>(element), timeout, lk, true);
 			}
 			return _push(std::forward<E>(element), timeout, lk);
 		}
@@ -525,33 +569,25 @@ namespace queue {
 				}
 			}
 
-			bool wake = popped && Queue_t::_state->_push_waiters &&
-				Queue_t::_items_queue.size() < Queue_t::_state->_threshold;
-
+			auto wake = popped ? Queue_t::_state->_room_freed(1) : QueueState::_wake::none;
 			lk.unlock();
 
-			if (wake) {
-				// Notifiy waiting thread it can push/pop now
-				Queue_t::_state->_push_cond.notify_one();
-			}
+			Queue_t::_state->_wake_pushers(wake);
 
 			return popped;
 		}
 
 		void clear() {
-			std::lock_guard<std::mutex> lk(Queue_t::_state->_mutex);
-			bool cleared = Queue_t::_clear_impl(lk) && Queue_t::_state->_push_waiters;
-
+			std::unique_lock<std::mutex> lk(Queue_t::_state->_mutex);
+			auto wake = Queue_t::_state->_room_freed(Queue_t::_clear_impl(lk));
 			_items_map.clear();
+			lk.unlock();
 
-			if (cleared) {
-				// Notifiy waiting thread it can push/pop now
-				Queue_t::_state->_push_cond.notify_one();
-			}
+			Queue_t::_state->_wake_pushers(wake);
 		}
 
 		size_t erase(const Key& key) {
-			std::lock_guard<std::mutex> lk(Queue_t::_state->_mutex);
+			std::unique_lock<std::mutex> lk(Queue_t::_state->_mutex);
 			auto it = _items_map.find(key);
 			if (it == _items_map.end()) {
 				return 0;
@@ -560,6 +596,10 @@ namespace queue {
 			_items_map.erase(it);
 			assert(Queue_t::_state->_cnt > 0);
 			Queue_t::_state->_cnt_sub(1);
+			auto wake = Queue_t::_state->_room_freed(1);
+			lk.unlock();
+
+			Queue_t::_state->_wake_pushers(wake);
 			return 1;
 		}
 	};

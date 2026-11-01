@@ -39,6 +39,14 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   target_include_directories(queue_differential PRIVATE test)
   add_test(NAME queue_differential COMMAND queue_differential)
 
+  # (e) Liveness: every state change that lets a parked waiter go must wake it. One
+  # deterministic case per class of change, each under a deadline and a watchdog, so a
+  # lost wake-up fails instead of hanging; plus random mixed rounds (the TSan stress).
+  add_executable(queue_liveness test/liveness.cc)
+  target_link_libraries(queue_liveness PRIVATE queue)
+  add_test(NAME queue_liveness COMMAND queue_liveness)
+  add_test(NAME queue_liveness_stress COMMAND queue_liveness stress 400)
+
   # Sanitizer builds of the concurrent stress test. These are separate targets
   # (not run by ctest by default) because they want the Homebrew LLVM toolchain
   # and a scaled item count. Build with:

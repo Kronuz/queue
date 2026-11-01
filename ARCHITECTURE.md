@@ -26,28 +26,32 @@ copies that share it:
   (below).
 - `std::mutex _mutex` — the single lock guarding the container and the count.
   It is `mutable` so the `const` accessors (`empty`, `size`) can take it.
-- `std::condition_variable _pop_cond` — consumers wait here for an item;
-  producers and `clear` notify it.
-- `std::condition_variable _push_cond` — producers wait here for room; consumers
-  notify it when the queue drains below `_threshold`.
+- `std::condition_variable _push_cond` — producers wait here for room. Room is
+  `_cnt` against the limits, which every `Queue` on the state shares, so every
+  producer waits for the same thing and any of them can take a freed slot.
 - `std::atomic_size_t _cnt` — the live item count, kept alongside the container
   so `count()` can be read without taking the lock. It changes only under the
   mutex, so `_cnt_add` and `_cnt_sub` use a relaxed load plus a store instead of
   a locked read-modify-write.
-- `size_t _pop_waiters`, `_push_waiters` — the number of threads blocked in a
-  pop or push wait. They change only under the mutex and let a notifier skip
-  the condition-variable call when nobody waits.
+- `size_t _push_waiters` — the number of threads blocked in a push wait. It
+  changes only under the mutex and lets a notifier skip the condition-variable
+  call when nobody waits.
+- `_room_freed(freed)` and `_wake_pushers(wake)` — the one place that decides
+  which producers a drop of `_cnt` wakes (see "Wake-ups").
 
 The state is held by `std::shared_ptr`, so several `Queue`
 objects can share one `QueueState`. The two-arg constructor
 (`Queue(const std::shared_ptr<QueueState>&)`) is how a second
 view onto the same underlying state is constructed.
 
-Each `Queue` additionally owns its own `Container _items_queue` and two atomics,
-`_ending` and `_finished`. Note that the shutdown flags are
-per-`Queue`, not on the shared state, while the count and the condition
-variables are shared. For the common single-`Queue` case this distinction does
-not matter.
+Each `Queue` additionally owns its own `Container _items_queue`, two atomics,
+`_ending` and `_finished`, and the consumer side of the waiting: `_pop_cond`, where
+its consumers wait for an item, and `_pop_waiters`, their count. A consumer waits
+for this `Queue`'s items and flags, so its condition variable is per `Queue`: a
+shared one would let a push on one `Queue` wake a consumer of another, which goes
+back to sleep while the item waits. The count, the limits, the mutex and the
+producers' condition variable are shared. For the common single-`Queue` case this
+distinction does not matter.
 
 ## The wait machinery
 
@@ -69,7 +73,8 @@ three behaviors:
   `wait(lk, pred)` and no clock read.
 
 Both blocking branches increment `_push_waiters` before the wait and decrement
-it after.
+it after, and set the caller's `waited` flag: a thread that blocked may hold a
+`notify_one` meant for whoever takes the freed slot.
 
 After the wait, if the queue is finished or ending it returns false; otherwise it returns `_cnt < _soft_limit`. With
 the default limits (`hard == soft == SIZE_MAX`) the soft check is always true,
@@ -79,7 +84,7 @@ so an unbounded push always succeeds once it is not shutting down.
 
 Mirror image. The predicate is "shutting down, or there is an item":
 `_finished || _ending || !_items_queue.empty()`, with the same three timeout
-behaviors and the same `_pop_waiters` count. After the wait it returns false if
+behaviors, the `Queue`'s own `_pop_waiters` count and the same `waited` flag. After the wait it returns false if
 `_finished`, or if `_ending` and the queue is empty — so an `end()`ing queue still drains its
 remaining items before pops start failing, while a `finish()`ed queue fails
 immediately even with items left.
@@ -96,15 +101,15 @@ representative):
 4. `lk.unlock()` explicitly.
 5. Notify a condition variable if step 3 said so.
 
-A successful push does `_pop_cond.notify_one()` when `_pop_waiters` is
-non-zero. A successful pop does `_push_cond.notify_one()` when `_push_waiters`
-is non-zero **and** the post-pop size is below `_threshold`, so a queue held near
-its bound does not wake producers it will only re-block. An unbounded queue
-never has a blocked pusher, so its pops never touch `_push_cond`.
+A successful push does `_pop_cond.notify_one()` when the `Queue`'s `_pop_waiters`
+is non-zero. A successful pop asks `_room_freed(1)`, which wakes one producer
+when `_push_waiters` is non-zero and the pop left `_cnt` below the hard limit. An
+unbounded queue never has a blocked pusher, so its pops never touch `_push_cond`.
 
-A **failed** op (a full or empty timeout, or a shutdown) notifies nothing. It
-changes no state, so no waiter can make progress. Shutdown wake-ups come from
-`end()` and `finish()`.
+A **failed** op (a full or empty timeout, or a shutdown) changes no state, so it
+notifies nothing, with one exception: a thread that blocked, was woken and then
+does not use what woke it hands the wake-up on (see "Wake-ups"). Shutdown
+wake-ups come from `end()` and `finish()`.
 
 `push_back` / `push_front` differ only in which end of the deque they touch;
 likewise `pop_back` / `pop_front`. `push`/`pop` are aliases for the back/front
@@ -115,9 +120,11 @@ bound entirely, pushing unconditionally.
 (`!(_finished || _ending) && _cnt < _hard_limit && _cnt < _soft_limit`), which is exactly
 the case where `_push_wait` returns true without waiting; only the other cases call the
 out-of-line `_push_wait`, and its `unique_lock` reference then escapes only on that path.
-The four hot operations are `QUEUE_HOT` (`always_inline`) so they compile into the
-producer or consumer loop. With the call to `_push_wait` on every push and the operations
-out of line, Apple clang on x86-64 ran the queue at 0.55x of a plain mutex queue at 8x8.
+The four hot operations and their `_impl` bodies are `QUEUE_HOT` (`always_inline`) so
+they compile into the producer or consumer loop. With the call to `_push_wait` on every
+push and the operations out of line, Apple clang on x86-64 ran the queue at 0.55x of a
+plain mutex queue at 8x8; with the waiting paths moved into separate out-of-line functions
+it lost 15-20% at 4x4 and 8x8.
 `_cnt` is stored with release ordering: a sequentially consistent store is an `xchg` on
 x86, a full barrier inside the critical section.
 
@@ -131,9 +138,12 @@ Three numbers, all on `QueueState`, all defaulting to `SIZE_MAX`:
   `_cnt < _soft_limit`. With `soft == hard` (the usual `Queue(N)` case, since
   both default to `SIZE_MAX` and only `hard` is passed) this collapses to the
   hard limit. A `soft < hard` configuration creates a hysteresis band.
-- **`_threshold`** — a pop only notifies a waiting producer when the post-pop
-  size is below it. It throttles wakeups so a near-full queue does not
-  thundering-herd its producers on every single pop.
+- **`_threshold`** — stored and accepted by the constructors, with no effect on
+  waiting or waking. A producer parked at the hard limit can push as soon as
+  `_cnt < _hard_limit`, so the pop that makes room wakes it; holding the wake-up
+  until the queue drains below a threshold would leave it asleep with room.
+  Each freed slot wakes at most one producer, so a near-full queue wakes one
+  producer per pop, not all of them.
 
 `count()` reads `_cnt` lock-free; `size()` reads
 `_items_queue.size()` under the lock. They can momentarily
@@ -153,12 +163,71 @@ Two stages, two atomics:
 
 Both are idempotent (they early-out if the flag is already set) and `noexcept`.
 Both call `_wake_all()`, which locks and unlocks the mutex and then broadcasts on
-both condition variables. A waiter holds the mutex from its predicate check
-until it is inside `wait()`, so the empty critical section orders the flag store
-before that waiter blocks and the broadcast cannot be lost. Every parked thread
-wakes, re-checks its predicate, and returns false. The destructor takes the
-mutex, subtracts the remaining items from `_cnt`, and runs `_finish_locked()`,
-so tearing down a queue releases any thread still blocked on it.
+the `Queue`'s `_pop_cond` and on the shared `_push_cond`. A waiter holds the mutex
+from its predicate check until it is inside `wait()`, so the empty critical
+section orders the flag store before that waiter blocks and the broadcast cannot
+be lost. Every parked thread of that `Queue` wakes, re-checks its predicate, and
+returns false; producers of other `Queue`s on the state re-check and sleep again.
+The destructor takes the mutex, subtracts the remaining items from `_cnt`, marks
+the queue finished and broadcasts on both, so tearing down a queue releases any
+thread still blocked on it and gives its slots to producers of other `Queue`s.
+
+## Wake-ups
+
+Untimed waits have no timeout and no periodic re-check, so every change that can
+make a parked thread's predicate true must wake a thread that acts on it. The
+predicates are, for a `Queue` Q:
+
+- a consumer: `Q._finished || Q._ending || !Q._items_queue.empty()`;
+- a producer: `Q._finished || Q._ending || _cnt < _hard_limit`.
+
+Every change, the waiters it can release, and what it wakes:
+
+| change | can release | wakes |
+|---|---|---|
+| `push_back`, `push_front`, forced or not; `QueueSet::push` | a consumer of this `Queue` | one on this `Queue`'s `_pop_cond`, if one is parked |
+| `pop_back`, `pop_front`, `QueueSet::pop`, `QueueSet::erase` (one slot) | a producer of any `Queue` on the state | one, if one is parked and `_cnt < _hard_limit` (`_room_freed(1)`) |
+| `clear()`, `QueueSet::clear()` (n slots) | producers of any `Queue` on the state | all for n > 1, one for n = 1, if any is parked and there is room; also when this `Queue` is stopping |
+| `end()`, `finish()` | this `Queue`'s consumers and producers | all, on this `Queue`'s `_pop_cond` and on `_push_cond`, after the empty critical section |
+| the destructor (its items leave `_cnt`) | its own waiters, and producers of other `Queue`s | all, on both |
+| a timed waiter's deadline | nobody: no state changes | nothing |
+| a woken waiter that does not use the wake-up | the next parked waiter | one, handed on (below) |
+
+A forced push only raises `_cnt`, so it releases consumers alone, like any push.
+The limits have no setter: they are fixed when the `QueueState` is built. Move
+construction and move assignment need both `Queue`s free of waiters.
+
+**Why one is enough.** The consumers parked on a `Queue`'s `_pop_cond` all wait
+for an item in that `Queue`, and the producers parked on `_push_cond` all wait for
+room in the shared count. A woken consumer that finds an item takes it; a woken
+producer that finds room takes a slot. So whenever a thread is blocked, the
+threads woken but not yet past their re-check number at least the items (or free
+slots): a waiter blocks only when there are none, each push or freed slot wakes a
+blocked thread when there is one, and each woken thread takes one or finds none
+left. The waiter counts include those woken threads, so a notify skipped because
+the count is zero is one that would have found nobody blocked.
+
+**Handing a wake-up on.** A woken thread can leave without taking what it was
+woken for in two ways: a producer that finds `_cnt < _hard_limit` but
+`_cnt >= _soft_limit` refuses, and inserting or taking the element can throw. Then
+the thread hands the wake-up to the next waiter before it leaves. `_push_wait`
+does it when it refuses after waiting, and a `_hand_on` guard, armed by a thread
+that waited, does it when the insert or take that follows throws: one producer if
+`_room_freed(1)` finds one parked with room, one consumer if one is parked and an
+item is left. Only a thread that blocked does this, and it notifies under the lock.
+A producer that leaves because its own `Queue` is stopping hands on too: a pop's
+`notify_one` can reach it between `end()`'s empty critical section and its
+broadcast.
+
+**Renewal.** `QueueSet::push` of a present key erases it and pushes it again at
+the front. That push cannot wait or refuse unless the queue is stopping: the erase
+leaves `_cnt` below both limits, and `QueueSet` has no `force` and no shared state.
+A stopping queue has no parked producers. A failed re-push still reports its slot
+to `_room_freed(1)`, like a pop.
+
+`test/liveness.cc` parks threads in each of these situations, confirms them
+parked through the waiter counts, makes the change, and fails if one is still
+asleep at a deadline.
 
 ## Move, copy, lifetime
 
@@ -183,12 +252,14 @@ under the same lock.
   lock.
 - **Notify after unlock.** Every public op unlocks before it notifies, so a
   woken thread does not immediately re-block on a lock the notifier still holds.
+  The hand-on of an unused wake-up is the exception: it runs under the lock, on
+  the slow path.
 - **Notify only a counted waiter.** The waiter counts and the wake decision are
   read under the mutex, so a skipped notify never strands a blocked thread.
 - **Untimed waits have no timeout.** A `timeout < 0` wait is a bare
   `wait(lk, pred)`. It relies on every state change that can satisfy a predicate
   either notifying a counted waiter or, for shutdown, locking the mutex before
-  the broadcast.
+  the broadcast ("Wake-ups").
 - **`force` bypasses the bound.** `push_*(elem, timeout, force=true)` skips the
   wait and the capacity check. It can push past `_hard_limit`; that is the
   caller's responsibility.
@@ -206,6 +277,11 @@ XOR checksum over the id space; a watchdog fails a hung run. Built with Homebrew
 LLVM 22, it runs clean under ASan (1,000,000 items: no leaks, no heap
 corruption, no use-after-free) and TSan (200,000 items: no data races), with
 nothing suppressed. AGENTS.md has the commands.
+
+`test/liveness.cc` covers every row of the table in "Wake-ups" with a
+deterministic case under a deadline, and runs random rounds of producers,
+consumers and clears on one `Queue` or two sharing a state, checking at
+quiescence that no item is left with its consumers asleep. Both run under TSan.
 
 ## Standalone vs. Xapiand
 

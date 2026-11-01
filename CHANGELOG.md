@@ -6,8 +6,59 @@ releases, so entries are dated.
 
 ## 2026-10-31
 
+### Fixed
+
+Untimed waits have had no periodic re-check since 2026-10-30, so a state change that let
+a parked thread go but woke nobody, or woke a thread that could not use it, left that
+thread asleep for good. Before 2026-10-30 each of these recovered within the one-second
+re-check. Every change that can release a waiter now wakes one that acts on it
+(ARCHITECTURE.md, "Wake-ups"):
+
+- With two `Queue`s on one `QueueState`, a push on one could wake the other's consumer,
+  which went back to sleep, and the pushed item waited with its own consumer asleep. The
+  consumers' condition variable and waiter count are per `Queue` (`_pop_cond`,
+  `_pop_waiters`); `QueueState` no longer has them.
+- `clear()` freed every slot and woke one parked producer, and none when its own `Queue`
+  was ending or finished. It wakes all of them (one when it freed one slot), whatever its
+  own flags: producers of other `Queue`s on the state can use the room.
+- `QueueSet::erase` freed a slot and woke nobody. It wakes one producer.
+- A pop that left the size at or above `threshold` woke no producer, so a producer parked
+  at the hard limit slept with room. A pop wakes one producer whenever it leaves the count
+  below the hard limit, and `threshold` no longer affects waking.
+- With the soft limit below the hard limit, a pop woke one of the producers parked at the
+  hard limit; it refused at the soft limit and the others slept on. A producer that waited
+  and then does not push (soft limit, shutdown, or an exception from the insert) wakes the
+  next one, and so does a consumer whose take throws.
+- Destroying a finished `Queue` on a shared state gave its slots back without waking the
+  other `Queue`s' producers.
+- `QueueSet::clear()` did not compile: it passed a `lock_guard` to a `unique_lock&`.
+
+### Added
+
+- `test/liveness.cc` (CTest `queue_liveness`, `queue_liveness_stress`): one case per state
+  change that can release a parked waiter. Each parks threads, confirms them parked
+  through the waiter counts, makes the change, and fails at a 10 s deadline if one is still
+  asleep; a watchdog fails a case that cannot release its threads. The stress mode runs
+  random rounds of producers, consumers and clears on one `Queue` or two sharing a state,
+  and checks at quiescence that no item is left with its consumers asleep. Nine of the 25
+  cases fail on the header before this change (the `QueueSet::clear()` case did not compile
+  there), and so does the stress mode; the other cases cover wake-ups that already worked.
+
 ### Changed
 
+- The four `_impl` bodies are force-inlined (`QUEUE_HOT`) like the operations that call
+  them, and the waits stay inside them. Grown by the wake-up hand-on, `_push_back_impl` was
+  left out of line by Apple clang, and with the waits in separate out-of-line functions the
+  queue lost 15-20% at 4x4 and 8x8 on x86. Throughput against the inline fast path below
+  (`44211ce`), interleaved, 1.5M items, the A/A row a second copy of `44211ce`; both
+  binaries from Apple clang 17 (GitHub macos-15 runner):
+
+  | ratio to `44211ce` | 1x1 | 2x2 | 4x4 | 8x8 |
+  |---|---:|---:|---:|---:|
+  | x86-64 i9-9980HK, 12 rounds | 1.03 | 1.01 | 0.98 | 0.99 |
+  | x86-64 i9-9980HK, A/A | 0.99 | 0.99 | 0.95 | 0.99 |
+  | arm64 M4 Pro, 15 rounds | 1.00 | 0.98 | 1.00 | 1.09 |
+  | arm64 M4 Pro, A/A | 1.01 | 0.97 | 1.01 | 1.07 |
 - `push_back` and `push_front` decide the common case (running, below both limits)
   inline, in `_push_room()`, and call the out-of-line `_push_wait` only to wait or to
   refuse. The four hot operations (`push_back`, `push_front`, `pop_back`, `pop_front`) are
