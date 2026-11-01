@@ -19,11 +19,10 @@ test/queue_frozen.h           Frozen copy of queue.h before the inline fast path
 tools/mutants.py              Breaks queue.h in 24 ways (a dropped notify, an uncounted wait, a wake not handed on, a count not given back) and requires a test to fail on each.
 benchmark/bench.cc            Throughput: queue vs mutex+condvar baseline vs moodycamel, single-ended MPMC path (QUEUE_BUILD_BENCH=ON; moodycamel is fetched at a pinned commit).
 CMakeLists.txt                INTERFACE library queue + alias queue::queue; test + sanitizer + bench targets, top-level only.
-LICENSE                       MIT, Copyright (c) 2015-2019 Dubalu LLC.
-README.md                     What it is, install, quick start, current benchmark numbers.
+LICENSE                       MIT, Copyright © 2026 Germán Méndez Bravo (Kronuz) and © 2015-2020 Dubalu LLC.
+README.md                     What it is, quick start, install, current benchmark numbers.
 CHANGELOG.md                  Dated changes, with earlier benchmark tables.
 docs/API.md                   The API reference.
-docs/queue.d2                 The README diagram's source (docs/queue.svg is rendered from it).
 ARCHITECTURE.md               Internal design: shared state, wait machinery, bound, shutdown, stability.
 ```
 
