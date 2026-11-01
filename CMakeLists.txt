@@ -64,15 +64,23 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   target_compile_options(queue_concurrent_tsan PRIVATE -fsanitize=thread -g -O1)
   target_link_options(queue_concurrent_tsan PRIVATE -fsanitize=thread)
 
-  # Throughput benchmark (queue vs mutex+condvar baseline vs moodycamel). Built
-  # at -O3 -DNDEBUG; needs the bundled concurrentqueue headers. Excluded from the
-  # default build so a plain `cmake --build` stays test-only:
-  #   cmake --build build --target queue_bench && ./build/queue_bench
-  set(MOODYCAMEL_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/concurrentqueue)
-  if(EXISTS ${MOODYCAMEL_DIR}/blockingconcurrentqueue.h)
-    add_executable(queue_bench EXCLUDE_FROM_ALL benchmark/bench.cc)
+  # Throughput benchmark: queue vs a mutex+condvar+deque baseline vs moodycamel's
+  # BlockingConcurrentQueue. Built at -O3 -DNDEBUG. The comparator is fetched at a pinned commit
+  # and used only by this target, never by the library:
+  #   cmake -B build -DQUEUE_BUILD_BENCH=ON && cmake --build build --target queue_bench
+  #   ./build/queue_bench
+  option(QUEUE_BUILD_BENCH "Build benchmark/bench.cc (fetches cameron314/concurrentqueue)" OFF)
+  if(QUEUE_BUILD_BENCH)
+    include(FetchContent)
+    FetchContent_Declare(concurrentqueue
+      GIT_REPOSITORY https://github.com/cameron314/concurrentqueue.git
+      GIT_TAG        1e2def448e43fb3362123ab5ff039c39e1ba5cfd
+      # Header-only: put the headers on the include path and skip its own CMake project.
+      SOURCE_SUBDIR  no-cmake-project)
+    FetchContent_MakeAvailable(concurrentqueue)
+    add_executable(queue_bench benchmark/bench.cc)
     target_link_libraries(queue_bench PRIVATE queue)
-    target_include_directories(queue_bench PRIVATE ${MOODYCAMEL_DIR})
+    target_include_directories(queue_bench PRIVATE ${concurrentqueue_SOURCE_DIR})
     target_compile_options(queue_bench PRIVATE -O3 -DNDEBUG)
   endif()
 endif()

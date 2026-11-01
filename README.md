@@ -99,9 +99,12 @@ as out-of-line calls they ran at 0.55x of the baseline at 8x8 under Apple clang.
 [CHANGELOG.md](CHANGELOG.md).
 
 ```sh
-cmake -B build -DCMAKE_CXX_COMPILER=$(brew --prefix llvm)/bin/clang++
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DQUEUE_BUILD_BENCH=ON
 cmake --build build --target queue_bench && ./build/queue_bench
 ```
+
+`QUEUE_BUILD_BENCH` is off by default; it fetches cameron314/concurrentqueue (moodycamel) at a pinned
+commit for the benchmark target only.
 
 ## 📚 Documentation
 

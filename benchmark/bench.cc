@@ -19,7 +19,8 @@
 // double-ended access, no per-op timeouts, and no graceful finish(), which are
 // the reasons (a) exists.
 //
-// Build: c++ -std=c++20 -O3 -DNDEBUG -I.. -I../third_party/concurrentqueue bench.cc
+// Build: cmake -B build -DQUEUE_BUILD_BENCH=ON && cmake --build build --target queue_bench
+// (fetches cameron314/concurrentqueue at a pinned commit, for this target only).
 
 #include <atomic>
 #include <chrono>
