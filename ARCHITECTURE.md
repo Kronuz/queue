@@ -111,6 +111,16 @@ likewise `pop_back` / `pop_front`. `push`/`pop` are aliases for the back/front
 pair. The `force` flag on the push path skips the wait and the
 bound entirely, pushing unconditionally.
 
+**The fast path stays in the caller.** `_push_back_impl` first asks `_push_room()`
+(`!(_finished || _ending) && _cnt < _hard_limit && _cnt < _soft_limit`), which is exactly
+the case where `_push_wait` returns true without waiting; only the other cases call the
+out-of-line `_push_wait`, and its `unique_lock` reference then escapes only on that path.
+The four hot operations are `QUEUE_HOT` (`always_inline`) so they compile into the
+producer or consumer loop. With the call to `_push_wait` on every push and the operations
+out of line, Apple clang on x86-64 ran the queue at 0.55x of a plain mutex queue at 8x8.
+`_cnt` is stored with release ordering: a sequentially consistent store is an `xchg` on
+x86, a full barrier inside the critical section.
+
 ## The bound
 
 Three numbers, all on `QueueState`, all defaulting to `SIZE_MAX`:

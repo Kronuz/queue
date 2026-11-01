@@ -90,6 +90,13 @@ the shape Xapiand uses.
 The comparison covers only the shared subset: moodycamel has no `pop_back`, no
 per-call deadline, and no `end()` or `finish()`.
 
+On x86-64 (Intel i9-9980HK, 8 cores / 16 threads), interleaved against the same
+mutex+condvar+deque baseline, `Queue` is 1.16x to 1.25x of the baseline with Apple clang
+and 1.25x to 1.47x with gcc 16 at 1x1, 2x2, 4x4 and 8x8; on Apple arm64 (M4 Pro) it is
+1.24x to 1.96x. The hot operations are force-inlined and decide the common case inline;
+as out-of-line calls they ran at 0.55x of the baseline at 8x8 under Apple clang. See
+[CHANGELOG.md](CHANGELOG.md).
+
 ```sh
 cmake -B build -DCMAKE_CXX_COMPILER=$(brew --prefix llvm)/bin/clang++
 cmake --build build --target queue_bench && ./build/queue_bench

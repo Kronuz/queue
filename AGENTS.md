@@ -12,6 +12,8 @@ sanitizers), the invariants you must not break, and the traps.
 queue.h                       The library. Queue<T, Container> + QueueSet<Key>, on a shared QueueState. Header-only.
 test/test.cc                  Correctness: single-threaded API coverage. CTest test `queue`.
 test/concurrent.cc            Concurrent stress: N producers x M consumers, exactly-once accounting. CTest test `queue_concurrent`. The binary you run under sanitizers.
+test/differential.cc          The same single-threaded operation sequences against test/queue_frozen.h; every result must match. CTest test `queue_differential`.
+test/queue_frozen.h           Frozen copy of queue.h before the inline fast path (1787904). The oracle for differential.cc: never edit it.
 benchmark/bench.cc            Throughput: queue vs mutex+condvar baseline vs moodycamel, single-ended MPMC path.
 third_party/concurrentqueue/  Vendored cameron314/concurrentqueue (header-only), for the benchmark only.
 CMakeLists.txt                INTERFACE library queue + alias queue::queue; test + sanitizer + bench targets, top-level only.
@@ -32,18 +34,22 @@ the benchmark.
 cmake -B build && cmake --build build && ctest --test-dir build
 ```
 
-Two CTest tests: `queue` (from `test/test.cc`) prints a line per API area and
+Three CTest tests: `queue` (from `test/test.cc`) prints a line per API area and
 ends with `all queue tests passed`; `queue_concurrent` (from
 `test/concurrent.cc`) prints a per-scenario accounting table and ends with
-`RESULT: OK`. Or directly:
+`RESULT: OK`; `queue_differential` (from `test/differential.cc`) ends with
+`all queue differential tests passed`. Or directly:
 
 ```sh
 c++ -std=c++20 -I. test/test.cc -o test/test && ./test/test
 c++ -std=c++20 -O2 -I. test/concurrent.cc -o test/concurrent && ./test/concurrent
+c++ -std=c++20 -I. -Itest test/differential.cc -o test/differential && ./test/differential
 ```
 
 `test/concurrent.cc` takes an optional item count (default 1,000,000); pass a
-smaller number to run it faster under a sanitizer.
+smaller number to run it faster under a sanitizer. g++ 11's ASan on the Linux VM
+crashes intermittently in LeakSanitizer at exit (4 of 20 runs of `test/test.cc`, with the
+original `queue.h` as well); run ASan with clang, or with `ASAN_OPTIONS=detect_leaks=0`.
 
 ## Run under sanitizers (the stability check)
 
@@ -115,6 +121,13 @@ produce a lost wakeup, a deadlock, or a torn read rather than a compile error.
 - **Shutdown locks before it broadcasts.** `_wake_all()` takes and releases the
   mutex before notifying. Untimed waits have no periodic re-check, so dropping
   that empty critical section can lose the shutdown wake-up.
+- **Keep the fast path inline.** `_push_room()` must stay exactly the case where
+  `_push_wait` returns true without waiting, and the four hot operations stay
+  `QUEUE_HOT`. Moving the common case back behind the out-of-line `_push_wait` halves
+  contended throughput on x86 with Apple clang (0.55x of a plain mutex queue at 8x8).
+  Time any change to these paths interleaved against a mutex+condvar+deque baseline,
+  twice, with an A/A column; a single best-of-N run on a shared host flipped the verdict
+  on this queue.
 
 ## Traps
 

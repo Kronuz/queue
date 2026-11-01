@@ -6,8 +6,42 @@ releases, so entries are dated.
 
 ## 2026-10-31
 
+### Changed
+
+- `push_back` and `push_front` decide the common case (running, below both limits)
+  inline, in `_push_room()`, and call the out-of-line `_push_wait` only to wait or to
+  refuse. The four hot operations (`push_back`, `push_front`, `pop_back`, `pop_front`) are
+  force-inlined (`QUEUE_HOT`). Before, each was an out-of-line call that held the
+  `unique_lock` in memory across a second call; on an Intel i9-9980HK with Apple clang that
+  ran at 0.92x, 0.71x, 0.57x and 0.55x of a mutex+condvar+deque baseline at 1x1, 2x2, 4x4
+  and 8x8 producers and consumers. Behavior is unchanged: `_push_room()` is the case where
+  `_push_wait` returns true without waiting.
+- `_cnt` is stored with release ordering instead of sequentially consistent ordering. The
+  store is an `xchg` on x86, a full barrier inside the critical section, and a plain `mov`
+  with release; arm64 compiles both to the same `stlr`.
+
+  Million items/sec ratio to the baseline (>1 is faster), interleaved, 21 rounds, 1.5M
+  items, A/A within 1.5%:
+
+  | | 1x1 | 2x2 | 4x4 | 8x8 |
+  |---|---:|---:|---:|---:|
+  | x86-64 i9-9980HK, Apple clang, before | 0.92 | 0.71 | 0.57 | 0.55 |
+  | x86-64 i9-9980HK, Apple clang, after | 1.16 | 1.25 | 1.16 | 1.17 |
+  | x86-64 i9-9980HK, gcc 16, before | 1.05 | 1.17 | 1.11 | 1.07 |
+  | x86-64 i9-9980HK, gcc 16, after | 1.31 | 1.47 | 1.29 | 1.25 |
+  | arm64 M4 Pro, Apple clang, before | 1.28 | 1.05 | 1.25 | 1.65 |
+  | arm64 M4 Pro, Apple clang, after | 1.66 | 1.24 | 1.38 | 1.96 |
+
+  On a Linux x86-64 VM (g++ 11, four pinned cores) the ratio went from 0.77, 1.01, 1.03
+  and 1.06 to 0.93, 1.05, 1.08 and 1.24.
+
 ### Added
 
+- `test/differential.cc` and `test/queue_frozen.h` (a frozen copy of `queue.h` before this
+  change): the same seeded single-threaded operation sequences run on both, over every limit
+  shape (unbounded, hard, soft below and above the hard limit, zero), both ends, `force`, the
+  non-blocking and timed calls, `clear`, `end` and `finish`; every return value, popped value,
+  `size()`, `count()` and `front()` must match.
 - `test/concurrent.cc` runs an all-untimed scenario under a watchdog that fails
   instead of hanging. Timed poppers masked a missed wake-up for an uncounted
   untimed waiter (mutant M2) (`47d4769`).
