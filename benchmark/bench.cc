@@ -13,9 +13,13 @@
 //                                  -- the fast lock-free-ish alternative.
 //
 // Each run: `total` items handed out across `nprod` producers, drained by
-// `ncons` consumers, then one poison per consumer for a clean stop. Throughput
-// is total / wall-clock of the push+drain, in million items/sec, best of a few
-// runs. The comparison is only fair on this shared subset: (c) has no
+// `ncons` consumers that each pop a fixed share of them (the shares add up to
+// `total`, so no consumer needs a stop marker: a blocking queue without a
+// global order, like (c), could deliver a marker before the last items).
+// Throughput is total / wall-clock of the push+drain, in million items/sec,
+// best of a few runs. Every run checks that the consumers received each item
+// exactly once (the sum of the ids), so all three deliver the same items.
+// The comparison is only fair on this shared subset: (c) has no
 // double-ended access, no per-op timeouts, and no graceful finish(), which are
 // the reasons (a) exists.
 //
@@ -26,6 +30,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <thread>
 #include <vector>
 
@@ -58,25 +63,27 @@ public:
 	}
 };
 
-static constexpr int POISON = -1;
-
 // Adapters give all three the same push(int) / pop()->int shape so one harness
 // drives them. queue::Queue and moodycamel both report success via bool; the
-// baseline returns by value.
+// baseline returns by value. A pop that fails returns 0, which the id-sum check
+// counts as a missing item.
 
 struct QueueAdapter {
+	static constexpr const char* name = "queue::Queue<int>";
 	queue::Queue<int> q;                         // effectively unbounded
 	void push(int v) { q.push_back(v); }
 	int pop() { int v = 0; q.pop_front(v); return v; }
 };
 
 struct MutexAdapter {
+	static constexpr const char* name = "mutex+condvar+deque";
 	MutexDeque<int> q;
 	void push(int v) { q.push(v); }
 	int pop() { return q.pop(); }
 };
 
 struct MoodycamelAdapter {
+	static constexpr const char* name = "moodycamel::Blocking";
 	moodycamel::BlockingConcurrentQueue<int> q;
 	void push(int v) { q.enqueue(v); }
 	int pop() { int v = 0; q.wait_dequeue(v); return v; }
@@ -95,26 +102,32 @@ static double run_once(int nprod, int ncons, int total) {
 			for (;;) {
 				int id = next_id.fetch_add(1, std::memory_order_relaxed);
 				if (id >= total) break;
-				a.push(id + 1);                      // ids 1..total; -1 is poison
+				a.push(id + 1);                      // ids 1..total
 			}
 		});
 	}
 
+	std::atomic<long long> received{0}, id_sum{0};
 	std::vector<std::thread> consumers;
 	for (int c = 0; c < ncons; ++c) {
-		consumers.emplace_back([&] {
-			for (;;) {
-				int v = a.pop();
-				if (v == POISON) break;
-			}
+		const int share = total / ncons + (c < total % ncons ? 1 : 0);
+		consumers.emplace_back([&, share] {
+			long long sum = 0;
+			for (int i = 0; i < share; ++i) sum += a.pop();
+			received.fetch_add(share, std::memory_order_relaxed);
+			id_sum.fetch_add(sum, std::memory_order_relaxed);
 		});
 	}
 
 	for (auto& t : producers) t.join();
-	for (int c = 0; c < ncons; ++c) a.push(POISON);
 	for (auto& t : consumers) t.join();
 
 	auto dt = std::chrono::duration<double>(Clock::now() - t0).count();
+	if (received != total || id_sum != (long long)total * (total + 1) / 2) {
+		std::fprintf(stderr, "MISMATCH in %s (%dx%d): id sum %lld, expected %lld\n", Adapter::name, nprod, ncons,
+		             id_sum.load(), (long long)total * (total + 1) / 2);
+		std::abort();
+	}
 	return (double)total / dt / 1e6;             // million items/sec
 }
 

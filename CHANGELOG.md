@@ -27,6 +27,12 @@ releases, so entries are dated.
   cameron314/concurrentqueue at commit `1e2def4` for the bench target alone; the copy under
   `third_party/` is removed.
 
+- `benchmark/bench.cc` checks on every run that the consumers received each item exactly once (the
+  sum of the ids) for all three queues. Each consumer pops a fixed share of the items instead of
+  stopping at a poison value: moodycamel's queue keeps no order across producers, so its consumers
+  could take the poison first and stop with items left (up to 60% of them at 8x8 in a test run),
+  which counted unconsumed items in its throughput.
+
 ### Documented
 
 - A `Queue` is destroyed after the threads blocked in its calls have returned: the destructor
