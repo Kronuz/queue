@@ -79,24 +79,33 @@ the shape Xapiand uses.
 
 ## ⚡ Performance
 
-`benchmark/bench.cc` times the single-ended MPMC path (`push_back` /
-`pop_front`): 2,000,000 items, best of 3, million items/sec, Apple arm64.
+`benchmark/bench.cc` times the single-ended MPMC path (`push_back` / `pop_front`): 2,000,000
+items, best of 3, million items/sec, two runs each; producers x consumers.
+
+Apple M4 Pro (arm64, Apple clang 17.0.0):
 
 | | 1x1 | 2x2 | 4x4 | 8x8 |
 |---|---|---|---|---|
-| `queue::Queue<int>` | 44.8 | 15.2 | 19.5 | 30.6 |
-| mutex+condvar+deque | 33.5 | 15.4 | 14.7 | 19.3 |
-| moodycamel `BlockingConcurrentQueue` | 8.5 | 8.5 | 6.1 | 5.0 |
+| `queue::Queue<int>` | 41.4, 39.4 | 18.0, 19.8 | 20.0, 21.1 | 35.1, 34.0 |
+| mutex+condvar+deque | 31.3, 31.6 | 18.9, 17.9 | 18.2, 18.4 | 18.5, 19.8 |
+| moodycamel `BlockingConcurrentQueue` | 10.0, 9.6 | 5.8, 5.5 | 5.4, 6.0 | 5.5, 5.3 |
 
-The comparison covers only the shared subset: moodycamel has no `pop_back`, no
-per-call deadline, and no `end()` or `finish()`.
+Intel i9-9980HK (x86_64, 8 cores / 16 threads, Apple clang 17.0.0):
 
-On x86-64 (Intel i9-9980HK, 8 cores / 16 threads), interleaved against the same
-mutex+condvar+deque baseline, `Queue` is 1.16x to 1.25x of the baseline with Apple clang
-and 1.25x to 1.47x with gcc 16 at 1x1, 2x2, 4x4 and 8x8; on Apple arm64 (M4 Pro) it is
-1.24x to 1.96x. The hot operations are force-inlined and decide the common case inline;
-as out-of-line calls they ran at 0.55x of the baseline at 8x8 under Apple clang. See
-[CHANGELOG.md](CHANGELOG.md).
+| | 1x1 | 2x2 | 4x4 | 8x8 |
+|---|---|---|---|---|
+| `queue::Queue<int>` | 9.9, 9.0 | 6.7, 6.1 | 5.2, 4.7 | 3.7, 4.1 |
+| mutex+condvar+deque | 8.2, 7.6 | 5.3, 5.0 | 3.9, 3.8 | 3.3, 3.4 |
+| moodycamel `BlockingConcurrentQueue` | 8.5, 8.6 | 6.2, 6.4 | 10.0, 9.7 | 14.1, 13.3 |
+
+On arm64 `Queue` is at parity with the baseline at 2x2 (0.95x to 1.1x), 1.1x to 1.3x at 1x1
+and 4x4 and 1.7x to 1.9x at 8x8, and 3.1x to 6.4x moodycamel. On x86-64 it is 1.1x to 1.3x the
+baseline at every shape and level with moodycamel at 1x1 and 2x2, but moodycamel is 1.9x to 2.1x
+ahead at 4x4 and 3.2x to 3.8x ahead at 8x8: its lock-free design scales with the thread count and
+every `Queue` call takes one mutex. The comparison covers only the shared subset: moodycamel has
+no `pop_back`, no per-call deadline, and no `end()` or `finish()`. The hot operations are
+force-inlined and decide the common case inline; as out-of-line calls they ran at 0.55x of the
+baseline at 8x8 on x86-64 under Apple clang. See [CHANGELOG.md](CHANGELOG.md).
 
 ```sh
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DQUEUE_BUILD_BENCH=ON
