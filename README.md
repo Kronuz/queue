@@ -138,6 +138,8 @@ and every `Queue` call takes one mutex. The two runs of a row agree within 10%, 
 
 ## 📚 Documentation
 
+- [Sometimes a Mutex Is Right](https://kronuz.github.io/blog/queue/):
+  the Familiars post on why it exists and how it works.
 - [docs/API.md](docs/API.md): every call, its timeout rule, and `QueueSet`.
 - [ARCHITECTURE.md](ARCHITECTURE.md): the shared state, the limits, the waits and wake-ups, and
   the shutdown model.
